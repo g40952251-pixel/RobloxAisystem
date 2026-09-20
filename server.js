@@ -62,8 +62,8 @@ const ROBLOX_TOOLBOX_API_KEY = String(process.env.ROBLOX_TOOLBOX_API_KEY || '').
 
 const MAX_HISTORY = 12;
 const MAX_MESSAGE_CHARS = 5000;
-const REQUEST_TIMEOUT_MS = 25000;
-const MAX_RETRIES = 2;
+const REQUEST_TIMEOUT_MS = 15000;
+const MAX_RETRIES = 1;
 const MAX_BODY_BYTES = 1024 * 1024;
 
 const brains = new Map();
@@ -81,9 +81,9 @@ const lastProviderRequestAt = {
   grok: 0,
 };
 const MIN_GAP_MS = {
-  gpt: 250,
-  gemini: 1200,
-  grok: 300,
+  gpt: 0,
+  gemini: 150,
+  grok: 0,
 };
 
 function sleep(ms) {
@@ -296,24 +296,9 @@ function pushHistory(brain, role, content) {
 }
 
 async function withProviderQueue(provider, fn) {
-  const previous = providerQueues[provider] || Promise.resolve();
-  let release;
-  providerQueues[provider] = new Promise(resolve => {
-    release = resolve;
-  });
-
-  try {
-    await previous;
-
-    const elapsed = Date.now() - lastProviderRequestAt[provider];
-    const wait = MIN_GAP_MS[provider] - elapsed;
-    if (wait > 0) await sleep(wait);
-
-    lastProviderRequestAt[provider] = Date.now();
-    return await fn();
-  } finally {
-    release();
-  }
+  // V4 FAST: do not serialize all players behind one provider queue.
+  // Deterministic commands never reach this function.
+  return fn();
 }
 
 async function fetchJson(url, options, label) {
@@ -412,6 +397,12 @@ Yalnız bu JSON formasında cavab ver:
     }
   ]
 }
+
+FAST RULES:
+- Reply ən çox 80 simvol olsun.
+- İzah, markdown, kod bloku və əlavə mətn yazma.
+- Əmr aydındırsa birbaşa action qaytar.
+- Yalnız lazım olan 1-3 action qaytar.
 
 İcazəli action tipləri:
 STOP
@@ -741,6 +732,12 @@ function localCommand(message) {
     return result;
   }
 
+  if (hasAny('ucagi sur', 'uçağı sür', 'ucagi ucur', 'uçağı uçur', 'ucaqi ucur', 'uçaqı uçur', 'teyyareni ucur', 'təyyarəni uçur', 'havaya qalx', 'uçuşa başla')) {
+    result.reply = 'Təyyarəni uçururam.';
+    result.actions = [{ type: 'VEHICLE_DRIVE', aircraft: true, duration: 15, speed: 42, vertical: 0.35 }];
+    return result;
+  }
+
   if (hasAny('masina min', 'masına min', 'masina min', 'araba min', 'maşına min', 'vehicleda min', 'vehicle min', 'ucaga min', 'uçağa min', 'ucaga qalx', 'uçağa qalx', 'teyyareye min', 'təyyarəyə min')) {
     const aircraft = m.includes('ucaq') || m.includes('uçaq') || m.includes('teyyare') || m.includes('təyyarə');
     result.reply = aircraft ? 'Uçağa/təyyarəyə minirəm və uçuşa başlayıram.' : 'Maşına minib sürməyə başlayıram.';
@@ -748,7 +745,7 @@ function localCommand(message) {
     return result;
   }
 
-  if (hasAny('masini sur', 'maşını sür', 'masini sur', 'araba sur', 'vehicle drive', 'ucagi sur', 'uçağı sür', 'teyyareni sur', 'təyyarəni sür', 'ucaga qalx', 'uçağa qalx', 'havaya qalx')) {
+  if (hasAny('masini sur', 'maşını sür', 'araba sur', 'araba sür', 'vehicle drive')) {
     const aircraft = m.includes('ucaq') || m.includes('uçaq') || m.includes('teyyar') || m.includes('havaya');
     result.reply = aircraft ? 'Uçuşu başladım.' : 'Maşını sürürəm.';
     result.actions = [{ type: 'VEHICLE_DRIVE', aircraft, duration: 15, speed: aircraft ? 35 : 30, vertical: aircraft ? 0.15 : 0 }];
@@ -767,7 +764,7 @@ function localCommand(message) {
     return result;
   }
 
-  const danceMatch = rawMessage.match(/^(?:rəqs|reqs|dans|dance)\s*([1-7])$/i);
+  const danceMatch = message.match(/^(?:rəqs|reqs|dans|dance)\s*([1-7])$/i);
   if (danceMatch) {
     const variant = Math.max(1, Math.min(7, Number(danceMatch[1])));
     result.reply = 'Rəqs variantı ' + variant + ' başladı.';
@@ -883,8 +880,8 @@ async function callGrok({ ownerName, message, history, world, assets }) {
       body: JSON.stringify({
         model: ZENMUX_GROK_MODEL,
         messages,
-        temperature: 0.7,
-        max_tokens: actionMode ? 14000 : 500,
+        temperature: actionMode ? 0.15 : 0.65,
+        max_tokens: actionMode ? 2400 : 420,
       }),
     },
     'ZenMux Grok'
@@ -930,8 +927,8 @@ async function callGPT({ ownerName, message, history, world, assets }) {
       body: JSON.stringify({
         model: OPENAI_MODEL,
         messages,
-        temperature: 0.7,
-        max_tokens: actionMode ? 14000 : 500,
+        temperature: actionMode ? 0.15 : 0.65,
+        max_tokens: actionMode ? 2400 : 420,
       }),
     },
     'OpenAI'
@@ -991,8 +988,8 @@ async function callGemini({ ownerName, message, history, world, assets }) {
         },
         contents,
         generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: actionMode ? 14000 : 500,
+          temperature: actionMode ? 0.15 : 0.65,
+          maxOutputTokens: actionMode ? 2400 : 420,
         },
       }),
     },
@@ -1091,7 +1088,7 @@ async function processAI(provider, body) {
     const result = await withProviderQueue(provider, () => call({
       ownerName,
       message,
-      history: brain.history.slice(0, -1),
+      history: isActionMessage(message) ? [] : brain.history.slice(0, -1),
       world,
       assets,
     }));
