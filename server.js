@@ -2,10 +2,14 @@
 
 // Roblox GPT + Gemini AI Backend
 // Node.js 18+
-// .env:
-// OPENROUTER_API_KEY=...
-// GEMINI_API_KEY=...
-// PORT=3000
+//
+// Render Environment Variables:
+// OPENROUTER_API_KEY
+// GEMINI_API_KEY
+// ROBLOX_TOOLBOX_API_KEY
+// OPENROUTER_MODEL (optional)
+// GEMINI_MODEL (optional)
+// PORT is supplied by Render automatically.
 
 const http = require('http');
 const fs = require('fs');
@@ -16,386 +20,583 @@ if (typeof fetch !== 'function') {
 }
 
 function loadDotEnv() {
-  const envPath = path.join(process.cwd(), '.env');
-  if (!fs.existsSync(envPath)) return;
+  const file = path.join(process.cwd(), '.env');
+  if (!fs.existsSync(file)) return;
 
   try {
-    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
-    for (const raw of lines) {
+    for (const raw of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
       const line = raw.trim();
-      if (!line || line.startsWith('#')) continue;
 
-      const eq = line.indexOf('=');
-      if (eq < 1) continue;
-
-      const key = line.slice(0, eq).trim();
-      let value = line.slice(eq + 1).trim();
-
-      if (value.length >= 2) {
-        const a = value[0];
-        const b = value[value.length - 1];
-        if ((a === '"' && b === '"') || (a === "'" && b === "'")) {
-          value = value.slice(1, -1);
-        }
+      if (!line || line.startsWith('#')) {
+        continue;
       }
 
-      if (key && !process.env[key]) process.env[key] = value;
+      const i = line.indexOf('=');
+
+      if (i < 1) {
+        continue;
+      }
+
+      const key = line.slice(0, i).trim();
+      let value = line.slice(i + 1).trim();
+
+      if (
+        value.length >= 2 &&
+        (
+          (value[0] === '"' && value.at(-1) === '"') ||
+          (value[0] === "'" && value.at(-1) === "'")
+        )
+      ) {
+        value = value.slice(1, -1);
+      }
+
+      if (key && !process.env[key]) {
+        process.env[key] = value;
+      }
     }
-  } catch (err) {
-    console.warn('[ENV] .env oxunmadi:', err.message);
+  } catch (e) {
+    console.warn('[ENV]', e.message);
   }
 }
 
 loadDotEnv();
 
-const PORT = Number(process.env.PORT || 3000);
-const OPENROUTER_MODEL = String(process.env.OPENROUTER_MODEL || 'openrouter/free').trim();
-const GEMINI_MODEL = String(process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite').trim();
-const OPENROUTER_API_KEY = String(process.env.OPENROUTER_API_KEY || '').trim();
-const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
-const ROBLOX_TOOLBOX_API_KEY = String(process.env.ROBLOX_TOOLBOX_API_KEY || '').trim();
+const PORT = Number(
+  process.env.PORT || 3000
+);
 
+const OPENROUTER_MODEL = String(
+  process.env.OPENROUTER_MODEL ||
+  'openrouter/free'
+).trim();
+
+const GEMINI_MODEL = String(
+  process.env.GEMINI_MODEL ||
+  'gemini-3.1-flash-lite'
+).trim();
+
+const OPENROUTER_API_KEY = String(
+  process.env.OPENROUTER_API_KEY || ''
+).trim();
+
+const GEMINI_API_KEY = String(
+  process.env.GEMINI_API_KEY || ''
+).trim();
+
+const ROBLOX_TOOLBOX_API_KEY = String(
+  process.env.ROBLOX_TOOLBOX_API_KEY || ''
+).trim();
+
+const MAX_BODY = 1024 * 1024;
 const MAX_HISTORY = 12;
-const MAX_MESSAGE_CHARS = 5000;
-const REQUEST_TIMEOUT_MS = 25000;
-const MAX_RETRIES = 2;
-const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_PARTS = 500;
 
-const brains = new Map();
 const studioQueue = [];
-const studioCompleted = new Set();
-let studioRequestId = 1;
-const providerQueues = {
+const doneStudio = new Set();
+
+const memories = new Map();
+
+const queues = {
   gpt: Promise.resolve(),
-  gemini: Promise.resolve(),
-};
-const lastProviderRequestAt = {
-  gpt: 0,
-  gemini: 0,
-};
-const MIN_GAP_MS = {
-  gpt: 250,
-  gemini: 1200,
+  gemini: Promise.resolve()
 };
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+let studioId = 1;
+
+const sleep = ms =>
+  new Promise(resolve =>
+    setTimeout(resolve, ms)
+  );
+
+const s = (
+  value,
+  fallback = ''
+) =>
+  typeof value === 'string'
+    ? value
+    : fallback;
+
+function norm(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replaceAll('ı', 'i')
+    .replaceAll('ə', 'e')
+    .replaceAll('ö', 'o')
+    .replaceAll('ü', 'u')
+    .replaceAll('ş', 's')
+    .replaceAll('ç', 'c')
+    .replaceAll('ğ', 'g');
 }
 
-function safeString(value, fallback = '') {
-  return typeof value === 'string' ? value : fallback;
-}
-
-function clampText(value, max = MAX_MESSAGE_CHARS) {
-  return safeString(value).slice(0, max);
-}
-
-function normalizeProvider(value) {
-  const s = String(value || '').toLowerCase();
-  const compact = s.split(' ').join('').split('_').join('').split('-').join('');
-  if (
-    compact.includes('gemini') ||
-    compact.includes('gemni') ||
-    compact.includes('gemnii') ||
-    compact.includes('gmini')
-  ) {
-    return 'gemini';
-  }
-  return 'gpt';
-}
-
-function getOwnerId(body) {
-  if (!body || typeof body !== 'object') return 'unknown';
+function ownerId(body) {
   return String(
-    body.ownerUserId ??
-    body.userId ??
-    body.playerUserId ??
-    body.playerId ??
+    body?.ownerUserId ??
+    body?.userId ??
+    body?.playerUserId ??
     'unknown'
   );
 }
 
-function getOwnerName(body) {
-  if (!body || typeof body !== 'object') return 'Oyuncu';
-  return safeString(
-    body.ownerName ?? body.playerName ?? body.username ?? 'Oyuncu',
-    'Oyuncu'
+function ownerName(body) {
+  return s(
+    body?.ownerName ??
+    body?.playerName ??
+    body?.username,
+    'Owner'
   ).slice(0, 80);
 }
 
-function isActionMessage(message) {
-  const m = String(message || '').toLowerCase();
-  const words = [
-    'build', 'tik', 'tikil', 'tikinti', 'qur', 'yarat', 'hazirla', 'dizayn', 'dizayn et', 'tasarla', 'make', 'create', 'construct', 'house', 'ev', 'tower', 'qelle',
-    'qüllə', 'goz', 'göz', 'gez', 'gəz', 'wander', 'dayan', 'davam',
-    'izle', 'izlə', 'follow', 'tp', 'teleport', 'tullan', 'jump', 'dance',
-    'reqs', 'rəqs', 'toolbox', 'model', 'masin', 'maşın', 'vehicle', 'car',
-    'gey', 'geyin', 'wear', 'paltar', 'sil', 'remove', 'clear', 'edit',
-    'duzelt', 'düzəlt', 'outfit', 'script', 'server script', 'starterplayer', 'starterplayerscripts', 'localscript', 'local script', 'luau', 'kod yaz', 'script yaz', 'script sil', 'scripti sil', 'sil script', 'saga don', 'sağa dön', 'sola don',
-    'sola dön', 'duz get', 'düz get', 'suret', 'sürət', 'takip', 'teqib', 'qucaq', 'hug', 'carry', 'dasima', 'qaldir', 'dans etdir', 'dance etdir', 'birlikde', 'birlikdə', 'dansimizi', 'danimizi', 'dans dayandir', 'dansi durdur', 'dansimizi durdur'
-  ];
-  return words.some(word => m.includes(word));
+function messageOf(body) {
+  if (typeof body === 'string') {
+    return body.slice(0, 6000);
+  }
+
+  for (
+    const value of [
+      body?.message,
+      body?.text,
+      body?.prompt,
+      body?.query,
+      body?.input,
+      body?.userMessage,
+      body?.content,
+      body?.question
+    ]
+  ) {
+    if (
+      typeof value === 'string' &&
+      value.trim()
+    ) {
+      return value.slice(0, 6000);
+    }
+  }
+
+  return '';
 }
 
-function compactWorld(world) {
-  if (!world || typeof world !== 'object') return null;
+function json(res, code, data) {
+  res.statusCode = code;
 
-  const out = {};
+  res.setHeader(
+    'Access-Control-Allow-Origin',
+    '*'
+  );
 
-  if (Array.isArray(world.otherAIs)) {
-    out.otherAIs = world.otherAIs.slice(0, 12).map(ai => ({
-      provider: safeString(ai?.provider),
-      ownerName: safeString(ai?.ownerName),
-      distance: Number.isFinite(Number(ai?.distance)) ? Number(ai.distance) : null,
-      position: ai?.position
-        ? {
-            x: Number(ai.position.x) || 0,
-            y: Number(ai.position.y) || 0,
-            z: Number(ai.position.z) || 0,
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET,POST,OPTIONS'
+  );
+
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization'
+  );
+
+  res.setHeader(
+    'Content-Type',
+    'application/json; charset=utf-8'
+  );
+
+  const out = JSON.stringify(data);
+
+  res.setHeader(
+    'Content-Length',
+    Buffer.byteLength(out)
+  );
+
+  res.end(out);
+}
+
+function readBody(req) {
+  return new Promise(
+    (resolve, reject) => {
+      let text = '';
+      let size = 0;
+      let done = false;
+
+      req.on(
+        'data',
+        chunk => {
+          if (done) {
+            return;
           }
-        : null,
-      state: safeString(ai?.state),
-    }));
-  }
 
-  if (world.selfPosition) {
-    out.selfPosition = {
-      x: Number(world.selfPosition.x) || 0,
-      y: Number(world.selfPosition.y) || 0,
-      z: Number(world.selfPosition.z) || 0,
-    };
-  }
+          size += chunk.length;
 
-  if (world.ownerPosition) {
-    out.ownerPosition = {
-      x: Number(world.ownerPosition.x) || 0,
-      y: Number(world.ownerPosition.y) || 0,
-      z: Number(world.ownerPosition.z) || 0,
-    };
-  }
+          if (size > MAX_BODY) {
+            done = true;
 
-  if (Array.isArray(world.nearbyPlayers)) {
-    out.nearbyPlayers = world.nearbyPlayers.slice(0, 20).map(p => ({
-      name: safeString(p?.name),
-      distance: Number.isFinite(Number(p?.distance)) ? Number(p.distance) : null,
-      position: p?.position
-        ? {
-            x: Number(p.position.x) || 0,
-            y: Number(p.position.y) || 0,
-            z: Number(p.position.z) || 0,
+            reject(
+              new Error(
+                'Request çox böyükdür.'
+              )
+            );
+
+            req.destroy();
+
+            return;
           }
-        : null,
-    }));
-  }
 
-  if (Array.isArray(world.nearbyObjects)) {
-    out.nearbyObjects = world.nearbyObjects.slice(0, 40).map(o => ({
-      name: safeString(o?.name),
-      type: safeString(o?.type),
-      distance: Number.isFinite(Number(o?.distance)) ? Number(o.distance) : null,
-      position: o?.position
-        ? {
-            x: Number(o.position.x) || 0,
-            y: Number(o.position.y) || 0,
-            z: Number(o.position.z) || 0,
+          text += chunk.toString('utf8');
+        }
+      );
+
+      req.on(
+        'end',
+        () => {
+          if (done) {
+            return;
           }
-        : null,
-      size: o?.size
-        ? {
-            x: Number(o.size.x) || 0,
-            y: Number(o.size.y) || 0,
-            z: Number(o.size.z) || 0,
+
+          done = true;
+
+          if (!text.trim()) {
+            resolve({});
+            return;
           }
-        : null,
-    }));
-  }
 
-  if (world.vehicle) {
-    out.vehicle = {
-      name: safeString(world.vehicle.name),
-      available: world.vehicle.available === true,
-      occupied: world.vehicle.occupied === true,
-      position: world.vehicle.position
-        ? {
-            x: Number(world.vehicle.position.x) || 0,
-            y: Number(world.vehicle.position.y) || 0,
-            z: Number(world.vehicle.position.z) || 0,
+          try {
+            const parsed =
+              JSON.parse(text);
+
+            resolve(
+              typeof parsed === 'string'
+                ? {
+                    message: parsed
+                  }
+                : parsed
+            );
+          } catch {
+            resolve({
+              message:
+                text.trim()
+            });
           }
-        : null,
-    };
-  }
+        }
+      );
 
-  if (world.time !== undefined) out.time = world.time;
-  return out;
+      req.on(
+        'error',
+        error => {
+          if (!done) {
+            done = true;
+            reject(error);
+          }
+        }
+      );
+    }
+  );
 }
 
-function compactAssets(assets) {
-  if (!Array.isArray(assets)) return [];
-  return assets.slice(0, 60).map(a => {
-    if (typeof a === 'string') return a.slice(0, 150);
-    return {
-      name: safeString(a?.name),
-      assetId: a?.assetId ?? a?.id ?? null,
-      category: safeString(a?.category),
-      source: safeString(a?.source),
-    };
-  });
-}
+async function fetchJSON(
+  url,
+  options,
+  label
+) {
+  let last;
 
-function getBrain(ownerId, provider, incomingHistory) {
-  const key = ownerId + ':' + provider;
-  let brain = brains.get(key);
+  for (
+    let attempt = 0;
+    attempt < 3;
+    attempt++
+  ) {
+    const controller =
+      new AbortController();
 
-  if (!brain) {
-    brain = { history: [], updatedAt: Date.now() };
-    brains.set(key, brain);
-  }
-
-  if (brain.history.length === 0 && Array.isArray(incomingHistory)) {
-    brain.history = incomingHistory
-      .filter(x => x && (x.role === 'user' || x.role === 'assistant'))
-      .map(x => ({
-        role: x.role,
-        content: clampText(String(x.content || ''), 3500),
-      }))
-      .slice(-MAX_HISTORY);
-  }
-
-  return brain;
-}
-
-function pushHistory(brain, role, content) {
-  brain.history.push({
-    role,
-    content: clampText(content, 3500),
-  });
-
-  while (brain.history.length > MAX_HISTORY) {
-    brain.history.shift();
-  }
-
-  brain.updatedAt = Date.now();
-}
-
-async function withProviderQueue(provider, fn) {
-  const previous = providerQueues[provider] || Promise.resolve();
-  let release;
-  providerQueues[provider] = new Promise(resolve => {
-    release = resolve;
-  });
-
-  try {
-    await previous;
-
-    const elapsed = Date.now() - lastProviderRequestAt[provider];
-    const wait = MIN_GAP_MS[provider] - elapsed;
-    if (wait > 0) await sleep(wait);
-
-    lastProviderRequestAt[provider] = Date.now();
-    return await fn();
-  } finally {
-    release();
-  }
-}
-
-async function fetchJson(url, options, label) {
-  let lastError = null;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timer =
+      setTimeout(
+        () =>
+          controller.abort(),
+        25000
+      );
 
     try {
-      const res = await fetch(url, {
-        ...options,
-        signal: controller.signal,
-      });
+      const response =
+        await fetch(
+          url,
+          {
+            ...options,
+            signal:
+              controller.signal
+          }
+        );
 
-      const text = await res.text();
+      const text =
+        await response.text();
+
       let data;
 
       try {
-        data = text ? JSON.parse(text) : null;
+        data = text
+          ? JSON.parse(text)
+          : null;
       } catch {
-        data = { raw: text };
+        data = {
+          raw: text
+        };
       }
 
-      if (res.ok) return data;
-
-      const detail = data?.error?.message || data?.message || data?.raw || ('HTTP ' + res.status);
-      const err = new Error(label + ' HTTP ' + res.status + ': ' + detail);
-      err.status = res.status;
-      lastError = err;
-
-      const retryable = [408, 429, 500, 502, 503, 504].includes(res.status);
-      if (!retryable || attempt >= MAX_RETRIES) throw err;
-
-      const retryAfter = Number(res.headers.get('retry-after'));
-      const wait = Number.isFinite(retryAfter) && retryAfter > 0
-        ? Math.min(retryAfter * 1000, 10000)
-        : 800 * (attempt + 1);
-
-      await sleep(wait);
-    } catch (err) {
-      if (err && err.name === 'AbortError') {
-        lastError = new Error(label + ': sorğu vaxt aşımına uğradı.');
-        lastError.status = 408;
-      } else {
-        lastError = err;
+      if (response.ok) {
+        return data;
       }
 
-      if (attempt >= MAX_RETRIES) throw lastError;
-      await sleep(700 * (attempt + 1));
+      const error =
+        new Error(
+          `${label} HTTP ${response.status}: ${
+            data?.error?.message ||
+            data?.message ||
+            data?.raw ||
+            ''
+          }`.trim()
+        );
+
+      error.status =
+        response.status;
+
+      last = error;
+
+      if (
+        ![
+          408,
+          429,
+          500,
+          502,
+          503,
+          504
+        ].includes(
+          response.status
+        ) ||
+        attempt === 2
+      ) {
+        throw error;
+      }
+
+      await sleep(
+        700 * (attempt + 1)
+      );
+    } catch (error) {
+      last =
+        error?.name ===
+        'AbortError'
+          ? Object.assign(
+              new Error(
+                `${label}: timeout`
+              ),
+              {
+                status: 408
+              }
+            )
+          : error;
+
+      if (attempt === 2) {
+        throw last;
+      }
+
+      await sleep(
+        700 * (attempt + 1)
+      );
     } finally {
       clearTimeout(timer);
     }
   }
 
-  throw lastError || new Error(label + ': naməlum xəta');
+  throw (
+    last ||
+    new Error(
+      label + ': naməlum xəta'
+    )
+  );
 }
 
-function buildSystemPrompt({ provider, ownerName, world, assets, actionMode }) {
-  const aiName = provider === 'gemini' ? 'Gemini' : 'GPT';
+function memoryFor(
+  id,
+  provider,
+  history
+) {
+  const key =
+    `${id}:${provider}`;
 
-  const base = [
-    'Sən Roblox oyununda yaşayan müstəqil AI NPC-sən.',
-    'Sənin adın ' + aiName + '-dir.',
-    'Sənin sahibin ' + ownerName + '-dir.',
-    '',
-    'Qaydalar:',
-    '- Cavabı əsasən Azərbaycan dilində ver.',
-    '- Təbii, qısa və konkret danış.',
-    '- Cavaba User:, Sage:, GPT:, Gemini: və ya [GPT]/[Gemini] kimi ad etiketi əlavə etmə.',
-    '- Roblox dünyasını nəzərə al.',
-    '- GPT və Gemini ayrı AI-lardır; yaddaşlarını qarışdırma.',
-    '- Başqa AI-ların mövcudluğunu dünya məlumatından görə bilərsən.',
-    '- Bir hərəkəti yerinə yetirmək üçün uyğun action qaytar.',
-    '- Normal hərəkət teleport deyil; Roblox tərəfi WALK_TO, JUMP, FOLLOW və VEHICLE_DRIVE kimi fiziki icra etməlidir.',
-    '- Dünya məlumatında maneə, player, model, maşın və digər obyektlər varsa, qərarında onlardan istifadə et.',
-  ].join('\n');
-
-  let context = '';
-  if (world) {
-    context += '\nDÜNYA MƏLUMATI:\n' + JSON.stringify(world) + '\n';
-  }
-  if (assets.length) {
-    context += '\nƏLÇATAN ASSETLƏR:\n' + JSON.stringify(assets) + '\n';
+  if (!memories.has(key)) {
+    memories.set(
+      key,
+      {
+        history: []
+      }
+    );
   }
 
-  if (actionMode) {
-    context += `
-\nCAVAB QAYDASI:
-Yalnız bu JSON formasında cavab ver:
+  const memory =
+    memories.get(key);
+
+  if (
+    !memory.history.length &&
+    Array.isArray(history)
+  ) {
+    memory.history =
+      history
+        .filter(
+          x =>
+            x &&
+            (
+              x.role === 'user' ||
+              x.role === 'assistant'
+            )
+        )
+        .slice(
+          -MAX_HISTORY
+        )
+        .map(
+          x => ({
+            role:
+              x.role,
+
+            content:
+              s(x.content)
+                .slice(
+                  0,
+                  3500
+                )
+          })
+        );
+  }
+
+  return memory;
+}
+
+function push(
+  memory,
+  role,
+  content
+) {
+  memory.history.push({
+    role,
+
+    content:
+      s(content)
+        .slice(
+          0,
+          3500
+        )
+  });
+
+  while (
+    memory.history.length >
+    MAX_HISTORY
+  ) {
+    memory.history.shift();
+  }
+}
+
+function worldMini(world) {
+  if (
+    !world ||
+    typeof world !== 'object'
+  ) {
+    return null;
+  }
+
+  return {
+    selfPosition:
+      world.selfPosition ||
+      null,
+
+    ownerPosition:
+      world.ownerPosition ||
+      null,
+
+    nearbyPlayers:
+      Array.isArray(
+        world.nearbyPlayers
+      )
+        ? world.nearbyPlayers
+            .slice(0, 15)
+        : [],
+
+    nearbyObjects:
+      Array.isArray(
+        world.nearbyObjects
+      )
+        ? world.nearbyObjects
+            .slice(0, 30)
+        : [],
+
+    nearbyVehicles:
+      Array.isArray(
+        world.nearbyVehicles
+      )
+        ? world.nearbyVehicles
+            .slice(0, 15)
+        : [],
+
+    obstacles:
+      Array.isArray(
+        world.obstacles
+      )
+        ? world.obstacles
+            .slice(0, 15)
+        : [],
+
+    vehicle:
+      world.vehicle ||
+      null
+  };
+}
+
+function systemPrompt(
+  provider,
+  body,
+  action
+) {
+  const ai =
+    provider === 'gemini'
+      ? 'Gemini'
+      : 'GPT';
+
+  const id =
+    ownerId(body);
+
+  let prompt = `
+Sən Roblox-da yaşayan ${ai} AI NPC-sən.
+Sahibin ${ownerName(body)}-dir.
+Owner UserId ${id}.
+
+Azərbaycan dilində təbii danış.
+Özbaşına hərəkət, tikinti və teleport etmə.
+İstifadəçi açıq tapşırıq verəndə uyğun action qaytar.
+Normal hərəkət fiziki olmalıdır.
+`;
+
+  if (body?.world) {
+    prompt +=
+      `
+DÜNYA:
+${JSON.stringify(
+  worldMini(body.world)
+)}
+`;
+  }
+
+  if (!action) {
+    prompt +=
+      `
+Adi söhbətdir.
+actions boş array qaytar.
+`;
+
+    return prompt;
+  }
+
+  prompt += `
+Yalnız JSON qaytar:
+
 {
-  "reply":"oyunçuya deyiləcək qısa cümlə",
-  "actions":[
-    {
-      "type":"ACTION"
-    }
-  ]
+  "reply":"qısa cavab",
+  "actions":[]
 }
 
-İcazəli action tipləri:
+İcazəli action-lar:
+
 STOP
 STOP_DANCE
 RESUME
@@ -425,892 +626,1503 @@ VEHICLE_DRIVE
 STUDIO_SCRIPT_CREATE
 STUDIO_SCRIPT_DELETE
 
+FOLLOW:
+{
+  "type":"FOLLOW",
+  "target":"OWNER"
+}
+
+COME:
+{
+  "type":"COME"
+}
+
+TELEPORT:
+{
+  "type":"TELEPORT"
+}
+
+JUMP:
+{
+  "type":"JUMP"
+}
+
+DANCE:
+{
+  "type":"DANCE"
+}
+
+DANCE_WITH_OWNER:
+{
+  "type":"DANCE_WITH_OWNER"
+}
+
+STOP_DANCE:
+{
+  "type":"STOP_DANCE"
+}
+
+HUG:
+{
+  "type":"HUG"
+}
+
+CARRY:
+{
+  "type":"CARRY"
+}
+
+DROP:
+{
+  "type":"DROP"
+}
+
+MOVE:
+{
+  "type":"MOVE",
+  "direction":"forward|back|left|right",
+  "duration":3,
+  "speed":8
+}
+
+WALK_TO:
+{
+  "type":"WALK_TO",
+  "position":[x,y,z],
+  "distance":3
+}
+
+TURN:
+{
+  "type":"TURN",
+  "direction":"LEFT|RIGHT",
+  "degrees":90
+}
+
+BUILD:
+{
+  "type":"BUILD",
+  "name":"Object",
+  "description":"istifadəçinin bütün detalları",
+  "parts":[
+    {
+      "name":"Part",
+      "shape":"Block",
+      "size":[4,1,4],
+      "offset":[0,0,0],
+      "material":"Plastic",
+      "color":[255,255,255],
+      "anchored":true
+    }
+  ]
+}
+
+BUILD QAYDALARI:
+
+- Yalnız ev, maşın və qatarla məhdudlaşma.
+- İstifadəçi nə istəyirsə onu qur.
+- Robot, təyyarə, gəmi, mağaza, qüllə, körpü, qala, otaq və s. qur.
+- İstifadəçinin ölçü, rəng, forma və digər detallarına əməl et.
+- İç hissəni də qur.
+- Otaq, qapı, pəncərə, mebel və digər detallar lazımdırsa parts ilə yarat.
+- Maşında təkər, kuzov, şüşə, oturacaq, sükan və işıq kimi detalları yarat.
+- Qatar üçün lokomotiv və vaqonları yarat.
+- Hazır model əvəzinə əsas tikintini BUILD parts ilə yarat.
+- Maksimum ${MAX_PARTS} Part.
+- İstifadəçi dekorasiya üçün Toolbox istəyirsə BUILD və TOOLBOX birlikdə qaytarıla bilər.
+- Sayğac üçün uydurma 0/10 və ya 10/10 yaratma.
+
+TOOLBOX:
+
+{
+  "type":"TOOLBOX",
+  "query":"specific model or decoration",
+  "count":1
+}
+
+Script:
+
 STUDIO_SCRIPT_CREATE:
-{"type":"STUDIO_SCRIPT_CREATE","scriptName":"OwnerPowerScript","scriptType":"Script|LocalScript|ModuleScript","targetService":"ServerScriptService|StarterPlayerScripts","targetName":"optional Part/Model name","targetPath":"optional Workspace path","prompt":"scriptin nə etməli olduğunu tam yaz"}
+
+{
+  "type":"STUDIO_SCRIPT_CREATE",
+  "scriptName":"AI_Script",
+  "scriptType":"Script|LocalScript|ModuleScript",
+  "targetService":"ServerScriptService|StarterPlayerScripts",
+  "targetName":"optional Part or Model",
+  "targetPath":"optional path",
+  "prompt":"full request"
+}
 
 STUDIO_SCRIPT_DELETE:
-{"type":"STUDIO_SCRIPT_DELETE","scriptName":"OwnerPowerScript","scriptType":"Script|LocalScript|ModuleScript","targetName":"optional Part/Model name","targetPath":"optional Workspace path","targetService":"ServerScriptService|StarterPlayerScripts"}
 
-Vacib script qaydası:
-- Yalnız ownerUserId üçün işləyən script yaz.
-- Yeni script yarat; mövcud scripti özbaşına düzəltmə və ya overwrite etmə.
-- Mövcud scripti yalnız istifadəçi açıq şəkildə silməyi istəyirsə sil.
-- Server script üçün ServerScriptService və ya istifadəçi konkret obyekt deyirsə həmin Model/Part içini istifadə et.
-- LocalScript yalnız LocalScript-in işlədiyi uyğun client konteynerində işləyir; istifadəçi maşının Modeli/Partı içində local davranış istəyirsə, uyğun client yerləşməsini nəzərə al.
-- ModuleScript seçiləndə scriptType=ModuleScript qaytar. ModuleScript özü avtomatik işləmir, require olunması nəzərdə tutulur.
-- İstifadəçi “maşının içindəki Part-a script yaz”, “evin Modelinə script yaz”, “bu Part-a yaz” deyirsə targetName və ya targetPath doldur.
-- Studio-da seçilmiş obyekt varsa plugin onu da hədəf kimi istifadə edə bilər.
-- Script source daxilində Owner UserId-ni sabit yoxla.
-- Əgər istifadəçi konkret script adı verməyibsə, mənalı unikal ad seç.
-- Script yaratmaq üçün yalnız yeni source qaytar; mövcud scripti düzəltmək və overwrite etmək istənmirsə etmə.
-- Bütün AI scriptləri müvəqqətidir: AIEphemeral=true, deleteOnOwnerLeave=true, doNotPersist=true.
-
-FOLLOW: {"type":"FOLLOW","target":"player adı və ya OWNER"}
-DANCE_WITH_OWNER: {"type":"DANCE_WITH_OWNER"}
-HUG: {"type":"HUG"}
-CARRY: {"type":"CARRY"}
-DROP: {"type":"DROP"}
-STOP_DANCE: {"type":"STOP_DANCE"}
-WALK_TO: {"type":"WALK_TO","position":[x,y,z],"distance":3}
-TURN: {"type":"TURN","direction":"LEFT|RIGHT","degrees":90}
-VEHICLE_ENTER: {"type":"VEHICLE_ENTER"}
-VEHICLE_EXIT: {"type":"VEHICLE_EXIT"}
-VEHICLE_DRIVE: {"type":"VEHICLE_DRIVE","target":"player adı və ya destination","follow":true}
-BUILD: {"type":"BUILD","name":"UserRequestedObject","description":"istifadəçinin bütün detalı","parts":[{"shape":"Block|Ball|Cylinder|Wedge","size":[4,1,4],"offset":[0,0,0],"material":"Plastic","color":[255,255,255],"anchored":true,"name":"Part"}]}
-TOOLBOX: {"type":"TOOLBOX","query":"specific decoration requested by user","count":1}
-WEAR: {"type":"WEAR","assetId":123}
-EDIT: {"type":"EDIT","target":"Part","properties":{"Size":[4,2,4],"Material":"Metal"}}
-REMOVE: {"type":"REMOVE","target":"Part"}
-CLEAR: sahibinin yaratdığın bütün BUILD və TOOLBOX obyektlərini sil.
-CLEAR_OUTFIT: geyimi təmizlə.
-
-UNIVERSAL BUILD QAYDASI:
-- Tikinti yalnız "ev", "maşın", "qatar" kimi nümunələrlə məhdud deyil. İstifadəçi nə təsvir edirsə, onu yarat.
-- İstifadəçinin ölçü, mərtəbə, otaq, qapı, pəncərə, mebel, mühərrik, təkər, oturacaq, rels, dam, dekorasiya və digər detallarını nəzərə al.
-- Ev istənirsə yalnız çöl divarları yox, istifadəçi içini istəyirsə daxili də yarat.
-- Maşın istənirsə kuzovla yanaşı təkər, oturacaq, sükan, şüşə, işıq və istifadəçinin istədiyi əlavə hissələri qur.
-- Qatar istənirsə lokomotiv, vaqonlar, təkərlər və lazım olan detallar qur.
-- Heç vaxt sorğuya uyğun olmayan hazır tipə keçmə; "spaceship" deyilirsə spaceship, "robot" deyilirsə robot, "shop" deyilirsə shop və s.
-- BUILD action-da hissələri bir-bir Part kimi göstər. Model hazır asset kimi istifadə olunmamalıdır.
-- İstifadəçi dekorasiya üçün Toolbox istəyirsə BUILD-dən sonra bir və ya bir neçə TOOLBOX action qaytara bilərsən.
-- İstifadəçi ayrıca Toolbox istəməyibsə, tikintinin əsas gövdəsini BUILD parts ilə et.
-- BUILD üçün istifadəçinin dediyi bütün detalları bir action-da mümkün qədər çox Part ilə təmsil et; limit 500 Part.
-- Sayğac yalnız həqiqətən action.parts içində göndərilən və Roblox-da yaradılan Part sayına uyğun olacaq; saxta 0/10 və ya sabit 10 yazma.
-
-Qeyd: İstifadəçi əmri nə qədər sərbəstdirsə, onu təhlil et və uyğun action qaytar. Mətndə nə etdiyini deməklə kifayətlənmə; action mütləq olsun.`;
-  } else {
-    context += '\nAdi söhbətdirsə actions boş array olsun.\n';
-  }
-
-  return (base + context).trim();
+{
+  "type":"STUDIO_SCRIPT_DELETE",
+  "scriptName":"AI_Script",
+  "scriptType":"Script|LocalScript|ModuleScript",
+  "targetService":"ServerScriptService|StarterPlayerScripts",
+  "targetName":"optional Part or Model",
+  "targetPath":"optional path"
 }
 
-function parseModelJson(text) {
-  let t = safeString(text).trim();
-  if (!t) return null;
+SCRIPT QAYDALARI:
 
-  if (t.startsWith('```')) {
-    const firstNewline = t.indexOf('\n');
-    if (firstNewline >= 0) t = t.slice(firstNewline + 1);
-    if (t.endsWith('```')) t = t.slice(0, -3).trim();
-  }
+- Yeni script yarat.
+- Mövcud scripti özbaşına düzəltmə.
+- Mövcud scripti overwrite etmə.
+- Owner UserId ${id} üçün işləsin.
+- Script AI tərəfindən müvəqqətidir.
+- Owner çıxanda silinəcək.
+- DataStore-a yazılmayacaq.
+- Maşının içindəki Part üçün targetName və ya targetPath istifadə et.
+- ModuleScript üçün scriptType ModuleScript.
+- LocalScript üçün uyğun client konteyneri seç.
+`;
+
+  return prompt;
+}
+
+function isActionMessage(
+  message
+) {
+  const m = norm(message);
+
+  return [
+    'tik',
+    'tikinti',
+    'qur',
+    'build',
+    'yarat',
+    'hazirla',
+    'ev',
+    'house',
+    'masin',
+    'car',
+    'qatar',
+    'train',
+    'robot',
+    'teyyare',
+    'gemi',
+    'ship',
+    'tower',
+    'qulle',
+    'korpu',
+    'bridge',
+    'toolbox',
+    'model',
+    'follow',
+    'takip',
+    'teqib',
+    'izle',
+    'gel',
+    'come',
+    'tp',
+    'teleport',
+    'tullan',
+    'jump',
+    'dance',
+    'dans',
+    'reqs',
+    'qucaq',
+    'hug',
+    'carry',
+    'dasi',
+    'qaldir',
+    'burax',
+    'drop',
+    'sola',
+    'saga',
+    'don',
+    'dayan',
+    'stop',
+    'davam',
+    'sil',
+    'clear',
+    'remove',
+    'edit',
+    'duzelt',
+    'gey',
+    'wear',
+    'script',
+    'luau',
+    'kod'
+  ].some(
+    x => m.includes(x)
+  );
+}
+
+function parseAI(raw) {
+  let text =
+    String(raw || '')
+      .trim()
+      .replace(
+        /^```(?:json)?\s*/i,
+        ''
+      )
+      .replace(
+        /\s*```$/,
+        ''
+      );
+
+  let parsed =
+    null;
 
   try {
-    return JSON.parse(t);
+    parsed =
+      JSON.parse(text);
   } catch {
-    const start = t.indexOf('{');
-    const end = t.lastIndexOf('}');
-    if (start >= 0 && end > start) {
+    const a =
+      text.indexOf('{');
+
+    const b =
+      text.lastIndexOf('}');
+
+    if (
+      a >= 0 &&
+      b > a
+    ) {
       try {
-        return JSON.parse(t.slice(start, end + 1));
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-}
-
-function normalizeAction(action) {
-  if (!action || typeof action !== 'object') return null;
-
-  const out = { ...action };
-  out.type = safeString(out.type).toUpperCase().trim();
-  if (!out.type) return null;
-
-  if (Array.isArray(out.position)) {
-    out.position = out.position.slice(0, 3).map(n => Number(n) || 0);
-  }
-  if (Array.isArray(out.offset)) {
-    out.offset = out.offset.slice(0, 3).map(n => Number(n) || 0);
-  }
-  if (Array.isArray(out.size)) {
-    out.size = out.size.slice(0, 3).map(n => Math.max(0.1, Number(n) || 1));
-  }
-  if (Array.isArray(out.color)) {
-    out.color = out.color.slice(0, 3).map(n => Math.max(0, Math.min(255, Number(n) || 0)));
-  }
-  if (Array.isArray(out.parts)) {
-    out.parts = out.parts.slice(0, 500).map(part => ({
-      ...part,
-      shape: safeString(part?.shape, 'Block'),
-      size: Array.isArray(part?.size)
-        ? part.size.slice(0, 3).map(n => Math.max(0.1, Number(n) || 1))
-        : [4, 1, 4],
-      offset: Array.isArray(part?.offset)
-        ? part.offset.slice(0, 3).map(n => Number(n) || 0)
-        : [0, 0, 0],
-      material: safeString(part?.material, 'Plastic'),
-      color: Array.isArray(part?.color)
-        ? part.color.slice(0, 3).map(n => Math.max(0, Math.min(255, Number(n) || 255)))
-        : [255, 255, 255],
-      anchored: part?.anchored !== false,
-      name: safeString(part?.name, 'Part'),
-    }));
-  }
-
-  if (out.scriptType !== undefined) out.scriptType = safeString(out.scriptType, 'Script');
-  if (out.typeName !== undefined) out.typeName = safeString(out.typeName, 'Script');
-  if (out.targetName !== undefined) out.targetName = safeString(out.targetName, '');
-  if (out.targetPath !== undefined) out.targetPath = safeString(out.targetPath, '');
-
-  if (out.degrees !== undefined) out.degrees = Math.max(1, Math.min(360, Number(out.degrees) || 90));
-  if (out.distance !== undefined) out.distance = Math.max(1, Math.min(100, Number(out.distance) || 3));
-  if (out.count !== undefined) out.count = Math.max(1, Math.min(10, Number(out.count) || 1));
-  if (out.assetId !== undefined) out.assetId = Number(out.assetId) || 0;
-
-  return out;
-}
-
-function cleanAIReply(text) {
-  let s = String(text || '').trim();
-
-  const prefixes = [
-    'GPT:',
-    'Gemini:',
-    'User:',
-    'USER:',
-    'Sage:',
-    'SAGE:',
-    '[GPT]',
-    '[Gemini]',
-    '[User]',
-    '[Sage]',
-  ];
-
-  for (const prefix of prefixes) {
-    if (s.toLowerCase().startsWith(prefix.toLowerCase())) {
-      s = s.slice(prefix.length).trim();
+        parsed =
+          JSON.parse(
+            text.slice(
+              a,
+              b + 1
+            )
+          );
+      } catch {}
     }
   }
 
-  return s;
-}
-
-function normalizeModelOutput(rawText) {
-  const parsed = parseModelJson(rawText);
-
-  if (parsed && typeof parsed === 'object') {
-    const actions = Array.isArray(parsed.actions)
-      ? parsed.actions.map(normalizeAction).filter(Boolean)
-      : [];
-
+  if (
+    !parsed ||
+    typeof parsed !== 'object'
+  ) {
     return {
-      reply: clampText(parsed.reply || parsed.message || parsed.text || 'Hazirdir.'),
-      actions,
-      raw: rawText,
+      reply:
+        String(
+          raw ||
+          'Hazirdir.'
+        ).slice(
+          0,
+          6000
+        ),
+
+      actions: []
     };
   }
 
+  const actions =
+    Array.isArray(
+      parsed.actions
+    )
+      ? parsed.actions
+          .filter(
+            a =>
+              a &&
+              typeof a ===
+                'object'
+          )
+          .map(
+            a => ({
+              ...a,
+
+              type:
+                String(
+                  a.type || ''
+                )
+                  .toUpperCase()
+            })
+          )
+          .filter(
+            a => a.type
+          )
+      : [];
+
   return {
-    reply: clampText(rawText || 'Hazirdir.'),
-    actions: [],
-    raw: rawText,
+    reply:
+      String(
+        parsed.reply ||
+        parsed.message ||
+        parsed.text ||
+        'Hazirdir.'
+      ).slice(
+        0,
+        6000
+      ),
+
+    actions
   };
 }
 
-function normalizeTextForCommand(message) {
-  return String(message || '')
-    .trim()
-    .toLowerCase()
-    .split('ı').join('i')
-    .split('ə').join('e')
-    .split('ö').join('o')
-    .split('ü').join('u')
-    .split('ş').join('s')
-    .split('ç').join('c');
-}
-
-function localCommand(message) {
-  const m = normalizeTextForCommand(message);
-  const result = { reply: '', actions: [], local: true };
-  const hasAny = (...phrases) => phrases.some(p => m.includes(normalizeTextForCommand(p)));
-
-  // TOOLBOX requests are handled deterministically so the AI cannot mistake
-  // a Toolbox request for a server-script request.
-  const wantsToolbox =
-    m.includes('toolbox') ||
-    m.includes('creator store') ||
-    m.includes('creatorstore');
-
-  if (wantsToolbox) {
-    let query = String(message || '').trim();
-
-    query = query
-      .replace(/^.*?toolbox(?:dan|dən|dan|den)?/i, '')
-      .replace(/^.*?creator\s*store/i, '')
-      .replace(/^(dan|dən|den|de|da)\s*/i, '')
-      .replace(/^(bir|bir dene|bir dənə|bir tane)\s+/i, '')
-      .replace(/\b(gotur|getir|götür|get|yerlesdir|yerlesdir|yerləşdir|qoy|al|modeli|model)\b/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    if (!query) query = 'decoration';
-
-    result.reply = 'Oldu, Toolbox-dan axtarıb götürürəm.';
-    result.actions = [{
-      type: 'TOOLBOX',
-      query,
-      count: 1,
-    }];
-    return result;
+async function askGPT(body) {
+  if (
+    !OPENROUTER_API_KEY
+  ) {
+    throw Object.assign(
+      new Error(
+        'OPENROUTER_API_KEY tapılmadı.'
+      ),
+      {
+        status: 401
+      }
+    );
   }
 
-  // Script requests remain deterministic.
-  const wantsDeleteScript =
-    m.includes('script sil') || m.includes('scripti sil') || m.includes('sil script') || m.includes('scripti poz');
+  const msg =
+    messageOf(body);
 
-  const wantsCreateScript =
-    m.includes('script yaz') || m.includes('script yarat') || m.includes('script hazirla') ||
-    m.includes('server script') || m.includes('starterplayer') || m.includes('localscript') ||
-    m.includes('local script') || m.includes('modulescript') || m.includes('module script') ||
-    m.includes('modulscript') || m.includes('modul script') || m.includes('luau kod') || m.includes('kod yaz');
+  const mode =
+    isActionMessage(msg);
 
-  if (wantsDeleteScript) {
-    result.reply = 'Oldu, öz yaratdığım scripti silirəm.';
-    result.actions = [{
-      type: 'STUDIO_SCRIPT_DELETE',
-      prompt: m,
-      scriptName: '',
-      targetService: scriptTargetFromPrompt(message, ''),
-    }];
-    return result;
-  }
+  const memory =
+    memoryFor(
+      ownerId(body),
+      'gpt',
+      body?.history
+    );
 
-  if (wantsCreateScript) {
-    const scriptType = inferScriptType(message, '');
-    const targetSpec = inferScriptTarget(message, '', '');
-    result.reply = 'Oldu, dediyin məlumata görə yeni script hazırlayıram.';
-    result.actions = [{
-      type: 'STUDIO_SCRIPT_CREATE',
-      prompt: message,
-      scriptType,
-      targetService: scriptTargetFromPrompt(message, ''),
-      targetName: targetSpec.targetName,
-      targetPath: targetSpec.targetPath,
-    }];
-    return result;
-  }
+  const response =
+    await fetchJSON(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        method: 'POST',
 
-  if (m === 'dayan' || m === 'dur' || m === 'stop' || hasAny('dans dayandir', 'dance dayandir', 'dansi dayandir', 'reqsi dayandir', 'dansimi durdur', 'dansimizi durdur', 'hareketi dayandir')) {
-    result.reply = 'Oldu, hamısını dayandırdım.';
-    result.actions = [{ type: 'STOP' }];
-    return result;
-  }
+        headers: {
+          Authorization:
+            'Bearer ' +
+            OPENROUTER_API_KEY,
 
-  if (hasAny('meni izleme', 'artiq izleme', 'artik izleme', 'follow off', 'follow dayandir', 'izlemeyi dayandir')) {
-    result.reply = 'Oldu, səni izləməyi dayandırdım.';
-    result.actions = [{ type: 'UNFOLLOW' }];
-    return result;
-  }
+          'Content-Type':
+            'application/json',
 
-  if (hasAny('meni takip et', 'meni takip ele', 'meni teqib et', 'meni teqib ele', 'meni izle', 'izle meni', 'izlemeni', 'izlə məni', 'follow me', 'ardimca gel')) {
-    result.reply = 'Oldu, səni izləyirəm.';
-    result.actions = [{ type: 'FOLLOW', target: 'OWNER' }];
-    return result;
-  }
+          'X-Title':
+            'Roblox AI NPC'
+        },
 
-  if (hasAny('mene gel', 'bura gel', 'buraya gel', 'yanima gel', 'yanima gəl', 'come here')) {
-    result.reply = 'Yanına gəlirəm.';
-    result.actions = [{ type: 'COME' }];
-    return result;
-  }
+        body:
+          JSON.stringify({
+            model:
+              OPENROUTER_MODEL,
 
-  if (hasAny('mene tp ol', 'mene tp ele', 'mene teleport ol', 'mene teleport et', 'meni tp et', 'meni teleport et', 'yanima tp ol')) {
-    result.reply = 'Yanına teleport oldum.';
-    result.actions = [{ type: 'TELEPORT' }];
-    return result;
-  }
+            messages: [
+              {
+                role:
+                  'system',
 
-  if (hasAny('meni tullan', 'tullan', 'jump', 'hopla')) {
-    result.reply = 'Oldu.';
-    result.actions = [{ type: 'JUMP' }];
-    return result;
-  }
+                content:
+                  systemPrompt(
+                    'gpt',
+                    body,
+                    mode
+                  )
+              },
 
-  if (hasAny('meni de dans etdir', 'meni de reqs etdir', 'məni də rəqs etdir', 'menimle dans et', 'menimle dance et', 'menimle reqs et', 'menimlə rəqs et', 'birlikde dans', 'birlikdə rəqs')) {
-    result.reply = 'Oldu, birlikdə rəqs edirik!';
-    result.actions = [{ type: 'DANCE_WITH_OWNER' }];
-    return result;
-  }
+              ...memory.history,
 
-  if (hasAny('dans et', 'dance et', 'reqs et', 'rəqs et', 'dance', 'dans', 'reqs', 'rəqs')) {
-    result.reply = 'Rəqs edirəm!';
-    result.actions = [{ type: 'DANCE' }];
-    return result;
-  }
+              {
+                role:
+                  'user',
 
-  if (hasAny('qucagina al', 'qucagima al', 'qucağına al', 'qucağıma al', 'meni qucagina al', 'məni qucağına al', 'hug me', 'hug')) {
-    result.reply = 'Oldu, səni qucaqladım.';
-    result.actions = [{ type: 'HUG' }];
-    return result;
-  }
+                content:
+                  msg
+              }
+            ],
 
-  if (hasAny('meni dasi', 'meni daşı', 'meni dasima al', 'meni qaldir', 'məni qaldır', 'carry me', 'carry')) {
-    result.reply = 'Oldu, səni qaldırdım.';
-    result.actions = [{ type: 'CARRY' }];
-    return result;
-  }
+            temperature:
+              0.65,
 
-  if (hasAny('burax meni', 'meni burax', 'birak meni', 'yere qoy meni', 'drop me', 'drop')) {
-    result.reply = 'Oldu, buraxdım.';
-    result.actions = [{ type: 'DROP' }];
-    return result;
-  }
-
-  if (hasAny('duz get', 'düz get', 'irəli get', 'ileri get', 'get qabağa', 'get qabaqa')) {
-    result.reply = 'İrəli gedirəm.';
-    result.actions = [{ type: 'MOVE', direction: 'forward', duration: 3, speed: 8 }];
-    return result;
-  }
-
-  if (hasAny('geri get', 'geriye get', 'geri')) {
-    result.reply = 'Geri gedirəm.';
-    result.actions = [{ type: 'MOVE', direction: 'back', duration: 3, speed: 8 }];
-    return result;
-  }
-
-  if (hasAny('sola get', 'sol get', 'left')) {
-    result.reply = 'Sola gedirəm.';
-    result.actions = [{ type: 'MOVE', direction: 'left', duration: 2, speed: 8 }];
-    return result;
-  }
-
-  if (hasAny('saga get', 'sağa get', 'saga don', 'sağa dön', 'right')) {
-    result.reply = 'Sağa gedirəm.';
-    result.actions = [{ type: 'MOVE', direction: 'right', duration: 2, speed: 8 }];
-    return result;
-  }
-
-  if (m === 'clear' || m === 'her seyi sil' || m === 'hamisini sil' ||
-      m.includes('qoyduqlarini sil') || m.includes('qoyduqlarimi sil') ||
-      m.includes('tikdiklerini sil') || m.includes('tikdiklerimi sil') ||
-      m.includes('qurduqlarini sil') || m.includes('qurduqlarimi sil') ||
-      m.includes('yerlesdirdiklerini sil') || m.includes('yerlesdirdiklerimi sil') ||
-      m.includes('yerləşdirdiklərini sil')) {
-    result.reply = 'Tikdiklərimi və qoyduqlarımı sildim.';
-    result.actions = [{ type: 'CLEAR' }];
-    return result;
-  }
-
-  if (m === 'clear outfit' || m === 'geyimi sil' || m === 'paltari sil') {
-    result.reply = 'Geyim təmizləndi.';
-    result.actions = [{ type: 'CLEAR_OUTFIT' }];
-    return result;
-  }
-
-  return null;
-}
-
-async function callGPT({ ownerName, message, history, world, assets }) {
-  if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY tapilmadi.');
-
-  const actionMode = isActionMessage(message);
-  const system = buildSystemPrompt({
-    provider: 'gpt',
-    ownerName,
-    world: actionMode ? compactWorld(world) : null,
-    assets: actionMode ? compactAssets(assets) : [],
-    actionMode,
-  });
-
-  const messages = [
-    { role: 'system', content: system },
-    ...history.slice(-MAX_HISTORY),
-    { role: 'user', content: clampText(message) },
-  ];
-
-  const data = await fetchJson(
-    'https://openrouter.ai/api/v1/chat/completions',
-    {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
-        'Content-Type': 'application/json',
-        'X-Title': 'Roblox Independent AI NPC',
+            max_tokens:
+              mode
+                ? 14000
+                : 500
+          })
       },
-      body: JSON.stringify({
-        model: OPENROUTER_MODEL,
-        messages,
-        temperature: 0.7,
-        max_tokens: actionMode ? 14000 : 500,
-      }),
-    },
-    'OpenRouter'
+
+      'OpenRouter'
+    );
+
+  return parseAI(
+    response
+      ?.choices?.[0]
+      ?.message
+      ?.content ||
+      ''
   );
-
-  const content = data?.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || !content.trim()) {
-    throw new Error('OpenRouter boş cavab qaytardı.');
-  }
-
-  return normalizeModelOutput(content);
 }
 
-async function callGemini({ ownerName, message, history, world, assets }) {
-  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY tapilmadi.');
-
-  const actionMode = isActionMessage(message);
-  const system = buildSystemPrompt({
-    provider: 'gemini',
-    ownerName,
-    world: actionMode ? compactWorld(world) : null,
-    assets: actionMode ? compactAssets(assets) : [],
-    actionMode,
-  });
-
-  const contents = [];
-
-  for (const item of history.slice(-MAX_HISTORY)) {
-    if (!item || (item.role !== 'user' && item.role !== 'assistant')) continue;
-
-    contents.push({
-      role: item.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: clampText(item.content, 3500) }],
-    });
+async function askGemini(
+  body
+) {
+  if (
+    !GEMINI_API_KEY
+  ) {
+    throw Object.assign(
+      new Error(
+        'GEMINI_API_KEY tapılmadı.'
+      ),
+      {
+        status: 401
+      }
+    );
   }
+
+  const msg =
+    messageOf(body);
+
+  const mode =
+    isActionMessage(msg);
+
+  const memory =
+    memoryFor(
+      ownerId(body),
+      'gemini',
+      body?.history
+    );
+
+  const contents =
+    memory.history.map(
+      item => ({
+        role:
+          item.role ===
+          'assistant'
+            ? 'model'
+            : 'user',
+
+        parts: [
+          {
+            text:
+              item.content
+          }
+        ]
+      })
+    );
 
   contents.push({
-    role: 'user',
-    parts: [{ text: clampText(message) }],
+    role:
+      'user',
+
+    parts: [
+      {
+        text:
+          msg
+      }
+    ]
   });
 
   const url =
     'https://generativelanguage.googleapis.com/v1beta/models/' +
-    encodeURIComponent(GEMINI_MODEL) +
+    encodeURIComponent(
+      GEMINI_MODEL
+    ) +
     ':generateContent';
 
-  const data = await fetchJson(
-    url,
-    {
-      method: 'POST',
-      headers: {
-        'x-goog-api-key': GEMINI_API_KEY,
-        'Content-Type': 'application/json',
+  const response =
+    await fetchJSON(
+      url,
+      {
+        method: 'POST',
+
+        headers: {
+          'x-goog-api-key':
+            GEMINI_API_KEY,
+
+          'Content-Type':
+            'application/json'
+        },
+
+        body:
+          JSON.stringify({
+            systemInstruction: {
+              parts: [
+                {
+                  text:
+                    systemPrompt(
+                      'gemini',
+                      body,
+                      mode
+                    )
+                }
+              ]
+            },
+
+            contents,
+
+            generationConfig: {
+              temperature:
+                0.65,
+
+              maxOutputTokens:
+                mode
+                  ? 14000
+                  : 500
+            }
+          })
       },
-      body: JSON.stringify({
-        systemInstruction: {
-          parts: [{ text: system }],
-        },
-        contents,
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: actionMode ? 14000 : 500,
-        },
-      }),
-    },
-    'Gemini'
-  );
 
-  const parts = data?.candidates?.[0]?.content?.parts;
-  const content = Array.isArray(parts)
-    ? parts.map(p => safeString(p?.text)).filter(Boolean).join('')
-    : '';
+      'Gemini'
+    );
 
-  if (!content.trim()) {
-    const reason = data?.candidates?.[0]?.finishReason || 'UNKNOWN';
-    throw new Error('Gemini boş cavab qaytardı (' + reason + ').');
-  }
+  const parts =
+    response
+      ?.candidates?.[0]
+      ?.content
+      ?.parts;
 
-  return normalizeModelOutput(content);
+  const text =
+    Array.isArray(parts)
+      ? parts
+          .map(
+            x =>
+              s(x?.text)
+          )
+          .join('')
+      : '';
+
+  return parseAI(text);
 }
 
-function extractMessage(body) {
-  if (typeof body === 'string') return clampText(body);
-  if (!body || typeof body !== 'object') return '';
-
-  const candidates = [
-    body.message,
-    body.text,
-    body.prompt,
-    body.query,
-    body.input,
-    body.userMessage,
-    body.messageText,
-    body.content,
-    body.question,
-    body.data?.message,
-    body.data?.text,
-    body.data?.prompt,
-    body.payload?.message,
-    body.payload?.text,
-    body.payload?.prompt,
-  ];
-
-  for (const value of candidates) {
-    if (typeof value === 'string' && value.trim()) return clampText(value);
-  }
-
-  return '';
-}
-
-async function processAI(provider, body) {
-  const safeBody = body && typeof body === 'object' ? body : {};
-  const ownerId = getOwnerId(safeBody);
-  const ownerName = getOwnerName(safeBody);
-  const message = extractMessage(body);
-
-  console.log(
-    '[' + provider.toUpperCase() + ' REQUEST]',
-    'owner=' + ownerId,
-    'message="' + message.slice(0, 120) + '"'
-  );
-
-  if (!message.trim()) {
-    return {
-      ok: false,
+async function processAI(
+  provider,
+  body
+) {
+  const memory =
+    memoryFor(
+      ownerId(body),
       provider,
-      reply: 'Mesaj boşdur.',
-      actions: [],
-    };
-  }
+      body?.history
+    );
 
-  const brain = getBrain(ownerId, provider, safeBody.history);
-  const local = localCommand(message);
+  const message =
+    messageOf(body);
+
+  const local =
+    simpleLocal(
+      body
+    );
 
   if (local) {
-    pushHistory(brain, 'user', message);
-    pushHistory(brain, 'assistant', local.reply);
+    push(
+      memory,
+      'user',
+      message
+    );
+
+    push(
+      memory,
+      'assistant',
+      local.reply
+    );
 
     return {
       ok: true,
       provider,
-      ownerUserId: ownerId,
-      ownerName,
-      reply: local.reply,
-      action: local.actions[0] || null,
-      actions: local.actions,
-      local: true,
+      ownerUserId:
+        ownerId(body),
+      ownerName:
+        ownerName(body),
+      ...local
     };
   }
 
-  const world = safeBody.world || safeBody.worldSnapshot || null;
-  const assets = safeBody.assets || safeBody.availableAssets || [];
-  const call = provider === 'gemini' ? callGemini : callGPT;
-
-  pushHistory(brain, 'user', message);
+  push(
+    memory,
+    'user',
+    message
+  );
 
   try {
-    const result = await withProviderQueue(provider, () => call({
-      ownerName,
-      message,
-      history: brain.history.slice(0, -1),
-      world,
-      assets,
-    }));
+    let result;
 
-    pushHistory(brain, 'assistant', result.reply);
+    if (
+      provider ===
+      'gemini'
+    ) {
+      queues.gemini =
+        queues.gemini.then(
+          () =>
+            askGemini(body)
+        );
+
+      result =
+        await queues.gemini;
+    } else {
+      queues.gpt =
+        queues.gpt.then(
+          () =>
+            askGPT(body)
+        );
+
+      result =
+        await queues.gpt;
+    }
+
+    push(
+      memory,
+      'assistant',
+      result.reply
+    );
 
     return {
       ok: true,
+
       provider,
-      ownerUserId: ownerId,
-      ownerName,
-      reply: result.reply,
-      action: result.actions[0] || null,
-      actions: result.actions,
-      raw: result.raw,
-      local: false,
+
+      ownerUserId:
+        ownerId(body),
+
+      ownerName:
+        ownerName(body),
+
+      ...result
     };
-  } catch (err) {
-    if (brain.history[brain.history.length - 1]?.role === 'user') {
-      brain.history.pop();
+  } catch (error) {
+    if (
+      memory.history.at(-1)
+        ?.role === 'user'
+    ) {
+      memory.history.pop();
     }
-
-    const status = Number(err?.status || 500);
-    let reply = provider === 'gemini'
-      ? 'Gemini hazırda cavab verə bilmədi.'
-      : 'GPT hazırda cavab verə bilmədi.';
-
-    if (status === 429) {
-      reply = provider === 'gemini'
-        ? 'Gemini sorğu limitinə çatdı. Bir az sonra yenidən yoxla.'
-        : 'GPT sorğu limitinə çatdı. Bir az sonra yenidən yoxla.';
-    } else if (status === 401 || status === 403) {
-      reply = provider === 'gemini'
-        ? 'Gemini API açarı qəbul edilmədi.'
-        : 'OpenRouter API açarı qəbul edilmədi.';
-    } else if (status === 400) {
-      reply = 'AI sorğusunun formatında problem var.';
-    }
-
-    console.error('[' + provider.toUpperCase() + ' ERROR]', err);
 
     return {
       ok: false,
+
       provider,
-      ownerUserId: ownerId,
-      ownerName,
-      reply,
-      action: null,
+
+      ownerUserId:
+        ownerId(body),
+
+      ownerName:
+        ownerName(body),
+
+      reply:
+        error?.message ||
+        'AI xətası.',
+
       actions: [],
-      error: err?.message || String(err),
-      status,
+
+      error:
+        error?.message ||
+        String(error),
+
+      status:
+        Number(
+          error?.status ||
+          500
+        )
     };
   }
 }
 
-function setCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+function scriptTarget(
+  prompt,
+  supplied
+) {
+  const p =
+    norm(prompt);
+
+  const r =
+    norm(supplied);
+
+  if (
+    r.includes(
+      'starterplayer'
+    ) ||
+    r.includes(
+      'localscript'
+    ) ||
+    r.includes(
+      'local script'
+    )
+  ) {
+    return 'StarterPlayerScripts';
+  }
+
+  if (
+    p.includes(
+      'starterplayer'
+    ) ||
+    p.includes(
+      'localscript'
+    ) ||
+    p.includes(
+      'local script'
+    ) ||
+    p.includes(
+      'client script'
+    ) ||
+    p.includes(
+      'keybind'
+    ) ||
+    p.includes(
+      'keyboard'
+    ) ||
+    p.includes(
+      'mouse'
+    )
+  ) {
+    return 'StarterPlayerScripts';
+  }
+
+  return 'ServerScriptService';
 }
 
-function sendJson(res, status, payload) {
-  setCors(res);
-  const data = JSON.stringify(payload);
-  res.statusCode = status;
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Content-Length', Buffer.byteLength(data));
-  res.end(data);
-}
+function scriptType(
+  prompt,
+  supplied
+) {
+  const p =
+    norm(prompt);
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    let size = 0;
-    let finished = false;
+  const r =
+    norm(supplied);
 
-    req.on('data', chunk => {
-      if (finished) return;
-
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        finished = true;
-        reject(new Error('Request çox böyükdür.'));
-        req.destroy();
-        return;
-      }
-
-      body += chunk.toString('utf8');
-    });
-
-    req.on('end', () => {
-      if (finished) return;
-      finished = true;
-
-      if (!body.trim()) {
-        resolve({});
-        return;
-      }
-
-      try {
-        const parsed = JSON.parse(body);
-        resolve(typeof parsed === 'string' ? { message: parsed } : parsed);
-      } catch {
-        resolve({ message: body.trim() });
-      }
-    });
-
-    req.on('error', err => {
-      if (finished) return;
-      finished = true;
-      reject(err);
-    });
-  });
-}
-
-
-function inferScriptType(prompt, requested) {
-  const p = normalizeTextForCommand(prompt);
-  const r = normalizeTextForCommand(requested);
-
-  if (r.includes('modulescript') || r.includes('module script') || r.includes('modulscript') || r.includes('modul script')) {
+  if (
+    r.includes('module') ||
+    p.includes(
+      'modulescript'
+    ) ||
+    p.includes(
+      'module script'
+    ) ||
+    p.includes(
+      'modulscript'
+    ) ||
+    p.includes(
+      'modul script'
+    )
+  ) {
     return 'ModuleScript';
   }
 
-  if (r.includes('localscript') || r.includes('local script')) {
-    return 'LocalScript';
-  }
-
-  if (p.includes('modulescript') || p.includes('module script') || p.includes('modulscript') || p.includes('modul script')) {
-    return 'ModuleScript';
-  }
-
-  if (p.includes('localscript') || p.includes('local script')) {
+  if (
+    r.includes('local') ||
+    p.includes(
+      'localscript'
+    ) ||
+    p.includes(
+      'local script'
+    )
+  ) {
     return 'LocalScript';
   }
 
   return 'Script';
 }
 
-function inferScriptTarget(prompt, providedName, providedPath) {
-  const p = String(prompt || '').trim();
-  const directName = safeString(providedName || '').trim();
-  const directPath = safeString(providedPath || '').trim();
+function inferTarget(
+  prompt,
+  name,
+  pathName
+) {
+  if (
+    name ||
+    pathName
+  ) {
+    return {
+      targetName:
+        s(name),
 
-  if (directPath) {
-    return { targetName: directName, targetPath: directPath };
+      targetPath:
+        s(pathName)
+    };
   }
 
-  if (directName) {
-    return { targetName: directName, targetPath: '' };
+  const p =
+    norm(prompt);
+
+  if (
+    p.includes(
+      'masinin icinde'
+    ) ||
+    p.includes(
+      'masinin icindeki'
+    )
+  ) {
+    return {
+      targetName:
+        'Car',
+
+      targetPath:
+        ''
+    };
   }
 
-  const m = normalizeTextForCommand(p);
-  const patterns = [
-    /(?:masinin|masin|car|evin|ev|obyektin|modelin|partin|part|modelin icine|modelin icindeki|parta|parta|part-in icine|icindeki parta)\s*(?:icindeki\s+)?(?:parta|parta)?/i,
-  ];
+  if (
+    p.includes(
+      'evin icinde'
+    ) ||
+    p.includes(
+      'evin icindeki'
+    )
+  ) {
+    return {
+      targetName:
+        'House',
 
-  let targetName = '';
+      targetPath:
+        ''
+    };
+  }
 
-  if (m.includes('masinin icinde') || m.includes('masinin icindeki') || m.includes('masin icinde')) targetName = 'Car';
-  else if (m.includes('evin icinde') || m.includes('evin icindeki')) targetName = 'House';
-  else if (m.includes('qatarin icinde') || m.includes('qatarin icindeki') || m.includes('trainin icindeki')) targetName = 'Train';
-  else if (m.includes('parta script') || m.includes('parta kod') || m.includes('bu parta')) targetName = '';
+  if (
+    p.includes(
+      'qatarin icinde'
+    ) ||
+    p.includes(
+      'qatarin icindeki'
+    )
+  ) {
+    return {
+      targetName:
+        'Train',
 
-  return { targetName, targetPath: '' };
+      targetPath:
+        ''
+    };
+  }
+
+  return {
+    targetName:
+      '',
+    targetPath:
+      ''
+  };
 }
 
-function scriptTargetFromPrompt(prompt, requested) {
-  const p = normalizeTextForCommand(prompt);
-  const r = normalizeTextForCommand(requested);
-  if (r.includes('starterplayer') || r.includes('localscript') || r.includes('local script')) {
-    return 'StarterPlayerScripts';
-  }
-  if (p.includes('starterplayer') || p.includes('localscript') || p.includes('local script') ||
-      p.includes('client script') || p.includes('input script') || p.includes('keybind') ||
-      p.includes('keyboard') || p.includes('mouse') || p.includes('fly') || p.includes('uc') ||
-      p.includes('uç') || p.includes('kamera') || p.includes('mousebutton')) {
-    return 'StarterPlayerScripts';
-  }
-  return 'ServerScriptService';
+function safeScriptName(
+  name,
+  type
+) {
+  return String(
+    name ||
+      (
+        type ===
+        'ModuleScript'
+          ? 'AI_Module'
+          : type ===
+            'LocalScript'
+            ? 'AI_LocalScript'
+            : 'AI_Script'
+      )
+  )
+    .replace(
+      /[^A-Za-z0-9_-]/g,
+      '_'
+    )
+    .slice(
+      0,
+      70
+    ) ||
+    'AI_Script';
 }
 
-function safeStudioName(name) {
-  const cleaned = safeString(name, '').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 70);
-  return cleaned || 'AI_GeneratedScript';
-}
-
-function ownerGuardSource(source, ownerUserId, targetService, scriptType) {
-  const id = Number(ownerUserId) || 0;
-  const src = String(source || '').trim();
-  if (!src) return src;
-
-  const marker = '-- AI_OWNER_GUARD';
-  if (src.includes(marker)) return src;
-
-  if (scriptType === 'LocalScript' || targetService === 'StarterPlayerScripts') {
-    return `${marker}
-local __AI_OWNER_USER_ID = ${id}
-local __AI_LOCAL_PLAYER = game:GetService("Players").LocalPlayer
-if not __AI_LOCAL_PLAYER or __AI_LOCAL_PLAYER.UserId ~= __AI_OWNER_USER_ID then return end
-
-${src}`;
+function guardSource(
+  source,
+  id,
+  target,
+  type
+) {
+  if (
+    source.includes(
+      '-- AI_OWNER_GUARD'
+    )
+  ) {
+    return source;
   }
 
-  if (scriptType === 'ModuleScript') {
-    return `${marker}
-local __AI_OWNER_USER_ID = ${id}
+  const n =
+    Number(id) || 0;
 
-${src}`;
+  if (
+    type ===
+      'LocalScript' ||
+    target ===
+      'StarterPlayerScripts'
+  ) {
+    return `-- AI_OWNER_GUARD
+local OWNER_USER_ID = ${n}
+local LocalPlayer = game:GetService("Players").LocalPlayer
+if not LocalPlayer or LocalPlayer.UserId ~= OWNER_USER_ID then return end
+
+${source}`;
   }
 
-  return `${marker}
-local __AI_OWNER_USER_ID = ${id}
-local __AI_PLAYERS = game:GetService("Players")
-local function __AI_IsOwner(player) return player and player.UserId == __AI_OWNER_USER_ID end
+  if (
+    type ===
+    'ModuleScript'
+  ) {
+    return `-- AI_OWNER_GUARD
+local OWNER_USER_ID = ${n}
 
-${src}`;
+${source}`;
+  }
+
+  return `-- AI_OWNER_GUARD
+local OWNER_USER_ID = ${n}
+local Players = game:GetService("Players")
+local function IsOwner(player)
+    return player and player.UserId == OWNER_USER_ID
+end
+
+${source}`;
 }
 
-async function generateStudioSource({ provider, prompt, ownerUserId, targetService, scriptType }) {
-  const finalScriptType = scriptType || (targetService === 'StarterPlayerScripts' ? 'LocalScript' : 'Script');
-  const system = [
-    'You generate Roblox Luau source only.',
-    'Return ONLY raw Luau source code. No markdown fences.',
-    `Target service: ${targetService}. Script type: ${finalScriptType}.`,
-    `Owner UserId: ${Number(ownerUserId) || 0}.`,
-    'The script is created by a Roblox Studio plugin.',
-    'Do not use loadstring, executor APIs, backdoors, arbitrary require IDs, or suspicious remote code.',
-    'Do not edit, delete, or overwrite existing scripts.',
-    'The code must be safe and intended only for the owner.',
-    'If script type is ModuleScript, return a valid module value/table at the end as appropriate.',
-    'If script type is LocalScript, use client-only APIs and only locations where LocalScripts run.',
-    'Honor every detail in the user request.',
-  ].join('\n');
+async function makeScript(
+  body
+) {
+  const prompt =
+    messageOf(body);
 
-  if (provider === 'gemini' && GEMINI_API_KEY) {
-    const data = await fetchJson(
-      'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(GEMINI_MODEL) + ':generateContent',
-      {
-        method: 'POST',
-        headers: {
-          'x-goog-api-key': GEMINI_API_KEY,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: system }] },
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.12, maxOutputTokens: 5000 },
-        }),
-      },
-      'Gemini Studio'
+  const id =
+    ownerId(body);
+
+  const name =
+    ownerName(body);
+
+  const provider =
+    normalizeProvider(
+      body?.provider
     );
-    const parts = data?.candidates?.[0]?.content?.parts;
-    const raw = Array.isArray(parts) ? parts.map(p => safeString(p?.text)).filter(Boolean).join('') : '';
-    return raw.replace(/^```(?:lua|luau)?\s*/i, '').replace(/\s*```$/i, '').trim();
-  }
 
-  if (provider === 'gpt' && OPENROUTER_API_KEY) {
-    const data = await fetchJson(
-      'https://openrouter.ai/api/v1/chat/completions',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: 'Bearer ' + OPENROUTER_API_KEY,
-          'Content-Type': 'application/json',
-          'X-Title': 'Roblox AI Studio Writer',
-        },
-        body: JSON.stringify({
-          model: OPENROUTER_MODEL,
-          messages: [
-            { role: 'system', content: system },
-            { role: 'user', content: prompt },
-          ],
-          temperature: 0.12,
-          max_tokens: 5000,
-        }),
-      },
-      'OpenRouter Studio'
+  const action =
+    norm(
+      body?.action ||
+      body?.type
+    ).toUpperCase();
+
+  const target =
+    scriptTarget(
+      prompt,
+      body?.targetService ||
+        body?.target
     );
-    const raw = data?.choices?.[0]?.message?.content || '';
-    return String(raw).replace(/^```(?:lua|luau)?\s*/i, '').replace(/\s*```$/i, '').trim();
+
+  const type =
+    scriptType(
+      prompt,
+      body?.scriptType ||
+        body?.typeName
+    );
+
+  const targetSpec =
+    inferTarget(
+      prompt,
+      body?.targetName,
+      body?.targetPath
+    );
+
+  const sn =
+    safeScriptName(
+      body?.scriptName ||
+        body?.name,
+      type
+    );
+
+  const requestId =
+    `studio_${Date.now()}_${studioId++}`;
+
+  if (
+    action.includes(
+      'DELETE'
+    )
+  ) {
+    const item = {
+      id:
+        requestId,
+
+      action:
+        'DELETE_SCRIPT',
+
+      provider,
+
+      ownerUserId:
+        id,
+
+      ownerName:
+        name,
+
+      scriptName:
+        sn,
+
+      scriptType:
+        type,
+
+      targetService:
+        target,
+
+      targetName:
+        targetSpec.targetName,
+
+      targetPath:
+        targetSpec.targetPath,
+
+      prompt,
+
+      ownerOnly:
+        true,
+
+      ephemeral:
+        true,
+
+      deleteOnOwnerLeave:
+        true,
+
+      doNotPersist:
+        true
+    };
+
+    studioQueue.push(
+      item
+    );
+
+    if (
+      studioQueue.length >
+      100
+    ) {
+      studioQueue.shift();
+    }
+
+    return {
+      ok: true,
+
+      requestId,
+
+      queued: true,
+
+      action:
+        item.action,
+
+      scriptName:
+        sn,
+
+      scriptType:
+        type,
+
+      targetService:
+        target,
+
+      targetName:
+        targetSpec.targetName,
+
+      targetPath:
+        targetSpec.targetPath
+    };
   }
 
-  return '';
+  if (!prompt) {
+    throw new Error(
+      'Script promptu boşdur.'
+    );
+  }
+
+  const system = `
+Roblox Luau source yaz.
+
+Target:
+${target}
+
+Type:
+${type}
+
+Owner UserId:
+${Number(id) || 0}
+
+Yalnız raw Luau qaytar.
+Mövcud scriptləri dəyişmə.
+Mövcud scriptləri silmə.
+Mövcud scriptlərin üstünə yazma.
+loadstring, executor, backdoor, arbitrary require və şübhəli remote code istifadə etmə.
+Script yalnız owner üçün işləsin.
+İstifadəçinin bütün detallarına əməl et.
+`;
+
+  let source = '';
+
+  try {
+    if (
+      provider === 'gpt' &&
+      OPENROUTER_API_KEY
+    ) {
+      const response =
+        await fetchJSON(
+          'https://openrouter.ai/api/v1/chat/completions',
+          {
+            method:
+              'POST',
+
+            headers: {
+              Authorization:
+                'Bearer ' +
+                OPENROUTER_API_KEY,
+
+              'Content-Type':
+                'application/json'
+            },
+
+            body:
+              JSON.stringify({
+                model:
+                  OPENROUTER_MODEL,
+
+                messages: [
+                  {
+                    role:
+                      'system',
+
+                    content:
+                      system
+                  },
+
+                  {
+                    role:
+                      'user',
+
+                    content:
+                      prompt
+                  }
+                ],
+
+                temperature:
+                  0.12,
+
+                max_tokens:
+                  5000
+              })
+          },
+
+          'OpenRouter Studio'
+        );
+
+      source =
+        String(
+          response
+            ?.choices?.[0]
+            ?.message
+            ?.content ||
+          ''
+        )
+          .replace(
+            /^```(?:lua|luau)?\s*/i,
+            ''
+          )
+          .replace(
+            /\s*```$/i,
+            ''
+          )
+          .trim();
+    } else if (
+      provider ===
+        'gemini' &&
+      GEMINI_API_KEY
+    ) {
+      const response =
+        await fetchJSON(
+          'https://generativelanguage.googleapis.com/v1beta/models/' +
+            encodeURIComponent(
+              GEMINI_MODEL
+            ) +
+            ':generateContent',
+
+          {
+            method:
+              'POST',
+
+            headers: {
+              'x-goog-api-key':
+                GEMINI_API_KEY,
+
+              'Content-Type':
+                'application/json'
+            },
+
+            body:
+              JSON.stringify({
+                systemInstruction: {
+                  parts: [
+                    {
+                      text:
+                        system
+                    }
+                  ]
+                },
+
+                contents: [
+                  {
+                    role:
+                      'user',
+
+                    parts: [
+                      {
+                        text:
+                          prompt
+                      }
+                    ]
+                  }
+                ],
+
+                generationConfig: {
+                  temperature:
+                    0.12,
+
+                  maxOutputTokens:
+                    5000
+                }
+              })
+          },
+
+          'Gemini Studio'
+        );
+
+      source =
+        Array.isArray(
+          response
+            ?.candidates?.[0]
+            ?.content
+            ?.parts
+        )
+          ? response.candidates[0]
+              .content
+              .parts
+              .map(
+                x =>
+                  s(
+                    x?.text
+                  )
+              )
+              .join('')
+              .replace(
+                /^```(?:lua|luau)?\s*/i,
+                ''
+              )
+              .replace(
+                /\s*```$/i,
+                ''
+              )
+              .trim()
+          : '';
+    }
+  } catch (error) {
+    console.warn(
+      '[STUDIO SOURCE]',
+      error.message
+    );
+  }
+
+  if (!source) {
+    if (
+      type ===
+        'LocalScript' ||
+      target ===
+        'StarterPlayerScripts'
+    ) {
+      source = `local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+if not player then
+    return
+end
+
+-- AI request:
+-- ${prompt
+  .replace(
+    /[\r\n]/g,
+    ' '
+  )
+  .slice(
+    0,
+    300
+  )}
+`;
+    } else if (
+      type ===
+      'ModuleScript'
+    ) {
+      source = `local Module = {}
+
+-- AI request:
+-- ${prompt
+  .replace(
+    /[\r\n]/g,
+    ' '
+  )
+  .slice(
+    0,
+    300
+  )}
+
+return Module
+`;
+    } else {
+      source = `local Players = game:GetService("Players")
+
+-- AI request:
+-- ${prompt
+  .replace(
+    /[\r\n]/g,
+    ' '
+  )
+  .slice(
+    0,
+    300
+  )}
+`;
+    }
+  }
+
+  source =
+    guardSource(
+      source,
+      id,
+      target,
+      type
+    );
+
+  const item = {
+    id:
+      requestId,
+
+    action:
+      'CREATE_SCRIPT',
+
+    provider,
+
+    ownerUserId:
+      id,
+
+    ownerName:
+      name,
+
+    scriptName:
+      sn,
+
+    scriptType:
+      type,
+
+    targetService:
+      target,
+
+    targetName:
+      targetSpec.targetName,
+
+    targetPath:
+      targetSpec.targetPath,
+
+    prompt,
+
+    source,
+
+    ownerOnly:
+      true,
+
+    ephemeral:
+      true,
+
+    deleteOnOwnerLeave:
+      true,
+
+    doNotPersist:
+      true,
+
+    doNotFixExisting:
+      true
+  };
+
+  studioQueue.push(
+    item
+  );
+
+  if (
+    studioQueue.length >
+    100
+  ) {
+    studioQueue.shift();
+  }
+
+  return {
+    ok: true,
+
+    requestId,
+
+    queued: true,
+
+    action:
+      item.action,
+
+    scriptName:
+      sn,
+
+    scriptType:
+      type,
+
+    targetService:
+      target,
+
+    targetName:
+      targetSpec.targetName,
+
+    targetPath:
+      targetSpec.targetPath
+  };
 }
 
-async function searchRobloxToolbox(query, count = 25) {
-  if (!ROBLOX_TOOLBOX_API_KEY) {
+async function toolboxSearch(
+  query,
+  limit
+) {
+  if (
+    !ROBLOX_TOOLBOX_API_KEY
+  ) {
     throw Object.assign(
-      new Error('ROBLOX_TOOLBOX_API_KEY tapılmadı.'),
-      { status: 401 }
+      new Error(
+        'ROBLOX_TOOLBOX_API_KEY tapılmadı. Render Environment Variables bölməsinə əlavə et.'
+      ),
+      {
+        status:
+          401
+      }
     );
   }
 
-  const q = encodeURIComponent(String(query || '').trim());
   const url =
     'https://apis.roblox.com/toolbox-service/v2/assets:search' +
     '?searchCategoryType=Model' +
-    '&query=' + q +
-    '&maxPageSize=' + Math.min(100, Math.max(1, Number(count) || 25)) +
+    '&query=' +
+    encodeURIComponent(
+      query
+    ) +
+    '&maxPageSize=' +
+    Math.min(
+      100,
+      Math.max(
+        1,
+        Number(
+          limit
+        ) || 25
+      )
+    ) +
     '&pageNumber=0' +
     '&searchView=Core' +
     '&includeOnlyVerifiedCreators=false' +
     '&sortCategory=Relevance';
 
-  const data = await fetchJson(
-    url,
-    {
-      method: 'GET',
-      headers: {
-        'x-api-key': ROBLOX_TOOLBOX_API_KEY,
-        'Content-Type': 'application/json',
+  const data =
+    await fetchJSON(
+      url,
+      {
+        method:
+          'GET',
+
+        headers: {
+          'x-api-key':
+            ROBLOX_TOOLBOX_API_KEY,
+
+          Accept:
+            'application/json'
+        }
       },
-    },
-    'Roblox Toolbox Search'
-  );
+
+      'Roblox Toolbox'
+    );
 
   const list =
     data?.creatorStoreAssets ||
@@ -1320,326 +2132,565 @@ async function searchRobloxToolbox(query, count = 25) {
     data?.data ||
     [];
 
-  if (!Array.isArray(list)) return [];
+  if (
+    !Array.isArray(list)
+  ) {
+    return [];
+  }
 
   return list
-    .map(item => {
-      const asset = item?.asset || item;
-      const id = Number(
-        asset?.id ??
-        asset?.assetId ??
-        asset?.AssetId ??
-        asset?.asset?.id
-      );
+    .map(
+      item => {
+        const asset =
+          item?.asset ||
+          item;
 
-      const name =
-        asset?.name ||
-        asset?.Name ||
-        asset?.asset?.name ||
-        ('Model_' + id);
+        const id =
+          Number(
+            asset?.id ??
+            asset?.assetId ??
+            asset?.AssetId ??
+            asset?.asset?.id
+          );
 
-      return id > 0
-        ? { id, name: String(name) }
-        : null;
-    })
+        const name =
+          asset?.name ||
+          asset?.Name ||
+          asset?.asset?.name ||
+          (
+            'Model_' +
+            id
+          );
+
+        return id > 0
+          ? {
+              id,
+              name:
+                String(
+                  name
+                )
+            }
+          : null;
+      }
+    )
     .filter(Boolean);
 }
 
-async function createStudioScript(body) {
-  const prompt = clampText(body?.prompt || body?.message || body?.text || '', 6000).trim();
-  const ownerUserId = getOwnerId(body);
-  const ownerName = getOwnerName(body);
-  const provider = normalizeProvider(body?.provider);
-  const action = String(body?.action || body?.type || 'CREATE').toUpperCase();
-  const targetService = scriptTargetFromPrompt(prompt, body?.targetService || body?.target || '');
-  const scriptType = inferScriptType(prompt, body?.scriptType || body?.typeName || '');
-  const targetSpec = inferScriptTarget(prompt, body?.targetName || '', body?.targetPath || '');
-  const requestedName = safeStudioName(body?.scriptName || body?.name || (scriptType === 'ModuleScript' ? 'AI_Module' : scriptType === 'LocalScript' ? 'AI_LocalScript' : 'AI_Script'));
-  const requestId = `studio_${Date.now()}_${studioRequestId++}`;
+async function handler(
+  req,
+  res
+) {
+  res.setHeader(
+    'Access-Control-Allow-Origin',
+    '*'
+  );
 
-  if (!prompt && action !== 'DELETE') {
-    throw new Error('Script promptu boşdur.');
-  }
-
-  if (action === 'DELETE' || action.includes('DELETE')) {
-    const item = {
-      id: requestId,
-      action: 'DELETE_SCRIPT',
-      provider,
-      ownerUserId,
-      ownerName,
-      scriptName: requestedName,
-      scriptType,
-      targetService,
-      targetName: targetSpec.targetName,
-      targetPath: targetSpec.targetPath,
-      prompt,
-      ownerOnly: true,
-      doNotFixExisting: true,
-      ephemeral: true,
-      deleteOnOwnerLeave: true,
-      doNotPersist: true,
-      createdAt: Date.now(),
-    };
-    studioQueue.push(item);
-    while (studioQueue.length > 100) studioQueue.shift();
-    return {
-      ok: true,
-      requestId,
-      queued: true,
-      action: 'DELETE_SCRIPT',
-      scriptName: requestedName,
-      targetService,
-    };
-  }
-
-  let source = '';
-  try {
-    source = await generateStudioSource({
-      provider,
-      prompt,
-      ownerUserId,
-      targetService,
-      scriptType,
-    });
-  } catch (err) {
-    console.warn('[STUDIO SOURCE]', err?.message || err);
-  }
-
-  if (!source) {
-    const id = Number(ownerUserId) || 0;
-    if (targetService === 'StarterPlayerScripts') {
-      source = `-- AI generated LocalScript\nlocal Players = game:GetService("Players")\nlocal OWNER_USER_ID = ${id}\nlocal LocalPlayer = Players.LocalPlayer\nif not LocalPlayer or LocalPlayer.UserId ~= OWNER_USER_ID then return end\n\n-- User request:\n-- ${prompt.replace(/[\r\n]/g, ' ').slice(0, 300)}\n`;
-    } else {
-      source = `-- AI generated ServerScript\nlocal Players = game:GetService("Players")\nlocal OWNER_USER_ID = ${id}\nlocal function isOwner(player) return player and player.UserId == OWNER_USER_ID end\n\n-- User request:\n-- ${prompt.replace(/[\r\n]/g, ' ').slice(0, 300)}\n`;
-    }
-  }
-
-  source = ownerGuardSource(source, ownerUserId, targetService, scriptType);
-
-  const item = {
-    id: requestId,
-    action: 'CREATE_SCRIPT',
-    provider,
-    ownerUserId,
-    ownerName,
-    scriptName: requestedName,
-    scriptType,
-    targetService,
-    targetName: targetSpec.targetName,
-    targetPath: targetSpec.targetPath,
-    prompt,
-    source,
-    ownerOnly: true,
-    doNotFixExisting: true,
-    ephemeral: true,
-    deleteOnOwnerLeave: true,
-    doNotPersist: true,
-    createdAt: Date.now(),
-  };
-
-  studioQueue.push(item);
-  while (studioQueue.length > 100) studioQueue.shift();
-
-  return {
-    ok: true,
-    requestId,
-    queued: true,
-    action: 'CREATE_SCRIPT',
-    scriptName: requestedName,
-    scriptType,
-    targetService,
-    targetName: targetSpec.targetName,
-    targetPath: targetSpec.targetPath,
-  };
-}
-
-const server = http.createServer(async (req, res) => {
-  setCors(res);
-
-  if (req.method === 'OPTIONS') {
-    res.statusCode = 204;
-    res.end();
-    return;
-  }
-
-  const url = new URL(req.url || '/', 'http://' + (req.headers.host || '127.0.0.1'));
-
-  if (req.method === 'GET' && url.pathname === '/health') {
-    sendJson(res, 200, {
-      ok: true,
-      message: 'Roblox AI backend işləyir.',
-      port: PORT,
-      models: {
-        gpt: OPENROUTER_MODEL,
-        gemini: GEMINI_MODEL,
-      },
-      keys: {
-        openrouter: Boolean(OPENROUTER_API_KEY),
-        gemini: Boolean(GEMINI_API_KEY),
-        robloxToolbox: Boolean(ROBLOX_TOOLBOX_API_KEY),
-      },
-      brains: brains.size,
-      node: process.version,
-    });
-    return;
-  }
-
-  if (req.method === 'GET' && url.pathname === '/studio-queue') {
-    sendJson(res, 200, {
-      ok: true,
-      items: studioQueue.filter(x => !studioCompleted.has(x.id)).slice(0, 10),
-    });
-    return;
-  }
-
-  // Roblox calls this endpoint from the live game with GET.
-  // Keep it BEFORE the generic POST-only guard, otherwise it always returns 405.
   if (
-    (req.method === 'GET' || req.method === 'POST') &&
-    url.pathname === '/toolbox-search'
+    req.method ===
+    'OPTIONS'
+  ) {
+    res.statusCode =
+      204;
+
+    res.end();
+
+    return;
+  }
+
+  const url =
+    new URL(
+      req.url || '/',
+      'http://' +
+        (
+          req.headers.host ||
+          'localhost'
+        )
+    );
+
+  if (
+    req.method ===
+      'GET' &&
+    url.pathname ===
+      '/health'
+  ) {
+    json(
+      res,
+      200,
+      {
+        ok: true,
+
+        message:
+          'Roblox AI backend işləyir.',
+
+        port:
+          PORT,
+
+        models: {
+          gpt:
+            OPENROUTER_MODEL,
+
+          gemini:
+            GEMINI_MODEL
+        },
+
+        keys: {
+          openrouter:
+            Boolean(
+              OPENROUTER_API_KEY
+            ),
+
+          gemini:
+            Boolean(
+              GEMINI_API_KEY
+            ),
+
+          robloxToolbox:
+            Boolean(
+              ROBLOX_TOOLBOX_API_KEY
+            )
+        },
+
+        brains:
+          memories.size,
+
+        studioQueue:
+          studioQueue.length,
+
+        node:
+          process.version
+      }
+    );
+
+    return;
+  }
+
+  if (
+    req.method ===
+      'GET' &&
+    url.pathname ===
+      '/studio-queue'
+  ) {
+    json(
+      res,
+      200,
+      {
+        ok: true,
+
+        items:
+          studioQueue
+            .filter(
+              x =>
+                !doneStudio.has(
+                  x.id
+                )
+            )
+            .slice(
+              0,
+              20
+            )
+      }
+    );
+
+    return;
+  }
+
+  // IMPORTANT:
+  // Toolbox GET route MUST come before generic POST check.
+  if (
+    (
+      req.method ===
+        'GET' ||
+      req.method ===
+        'POST'
+    ) &&
+    url.pathname ===
+      '/toolbox-search'
   ) {
     try {
-      let query = String(url.searchParams.get('query') || '').trim();
-      let limit = Number(url.searchParams.get('limit') || 25);
+      let query =
+        String(
+          url.searchParams.get(
+            'query'
+          ) ||
+          ''
+        ).trim();
 
-      if (req.method === 'POST') {
-        let body = {};
-        try {
-          body = await readBody(req);
-        } catch {}
-        query = String(body?.query || query || '').trim();
-        limit = Number(body?.limit || limit || 25);
+      let limit =
+        Number(
+          url.searchParams.get(
+            'limit'
+          ) ||
+          25
+        );
+
+      if (
+        req.method ===
+        'POST'
+      ) {
+        const body =
+          await readBody(
+            req
+          );
+
+        query =
+          String(
+            body?.query ||
+            query
+          ).trim();
+
+        limit =
+          Number(
+            body?.limit ||
+            limit ||
+            25
+          );
       }
 
       if (!query) {
-        sendJson(res, 400, {
-          ok: false,
-          error: 'Toolbox query boşdur.',
-          hasKey: Boolean(ROBLOX_TOOLBOX_API_KEY),
-        });
-        return;
+        return json(
+          res,
+          400,
+          {
+            ok: false,
+
+            error:
+              'Toolbox query boşdur.',
+
+            hasKey:
+              Boolean(
+                ROBLOX_TOOLBOX_API_KEY
+              )
+          }
+        );
       }
 
-      const results = await searchRobloxToolbox(query, limit);
+      const results =
+        await toolboxSearch(
+          query,
+          limit
+        );
 
-      sendJson(res, 200, {
-        ok: true,
-        query,
-        count: results.length,
-        results,
-      });
-    } catch (err) {
-      console.error('[TOOLBOX SEARCH ERROR]', err);
-      sendJson(res, 500, {
-        ok: false,
-        error: err?.message || String(err),
-        hasKey: Boolean(ROBLOX_TOOLBOX_API_KEY),
-        hint: !ROBLOX_TOOLBOX_API_KEY
-          ? 'Render Environment Variables bölməsində ROBLOX_TOOLBOX_API_KEY əlavə et.'
-          : 'Roblox API key-in creator-store-product:read icazəsini yoxla.',
-      });
+      return json(
+        res,
+        200,
+        {
+          ok: true,
+
+          query,
+
+          count:
+            results.length,
+
+          results
+        }
+      );
+    } catch (e) {
+      console.error(
+        '[TOOLBOX ERROR]',
+        e
+      );
+
+      return json(
+        res,
+        Number(
+          e?.status
+        ) || 500,
+        {
+          ok: false,
+
+          error:
+            e?.message ||
+            String(e),
+
+          hasKey:
+            Boolean(
+              ROBLOX_TOOLBOX_API_KEY
+            ),
+
+          hint:
+            ROBLOX_TOOLBOX_API_KEY
+              ? 'Roblox API key scope-unu yoxla.'
+              : 'Render Environment Variables bölməsində ROBLOX_TOOLBOX_API_KEY əlavə et.'
+        }
+      );
     }
-    return;
   }
 
-  if (req.method !== 'POST') {
-    sendJson(res, 405, {
-      ok: false,
-      error: 'POST istifadə edin.',
-    });
-    return;
+  if (
+    req.method !==
+    'POST'
+  ) {
+    return json(
+      res,
+      405,
+      {
+        ok: false,
+
+        error:
+          'POST istifadə edin.'
+      }
+    );
   }
 
   let body;
-  try {
-    body = await readBody(req);
-  } catch (err) {
-    sendJson(res, 400, {
-      ok: false,
-      reply: 'Sorğu oxunmadı.',
-      error: err?.message || String(err),
-    });
-    return;
-  }
 
-  if (req.method === 'POST' && url.pathname === '/studio-script') {
-    try {
-      const result = await createStudioScript(body);
-      sendJson(res, 200, result);
-    } catch (err) {
-      console.error('[STUDIO SCRIPT ERROR]', err);
-      sendJson(res, 500, {
+  try {
+    body =
+      await readBody(
+        req
+      );
+  } catch (e) {
+    return json(
+      res,
+      400,
+      {
         ok: false,
-        error: err?.message || String(err),
-      });
+
+        error:
+          e.message
+      }
+    );
+  }
+
+  if (
+    url.pathname ===
+    '/studio-script'
+  ) {
+    try {
+      return json(
+        res,
+        200,
+        await makeScript(
+          body
+        )
+      );
+    } catch (e) {
+      return json(
+        res,
+        Number(
+          e?.status
+        ) || 500,
+        {
+          ok: false,
+
+          error:
+            e?.message ||
+            String(e)
+        }
+      );
     }
-    return;
   }
 
-  if (req.method === 'POST' && url.pathname === '/studio-script-complete') {
-    const id = String(body?.requestId || '');
-    if (id) studioCompleted.add(id);
-    for (let i = studioQueue.length - 1; i >= 0; i--) {
-      if (studioQueue[i].id === id) studioQueue.splice(i, 1);
+  if (
+    url.pathname ===
+      '/studio-script-complete' ||
+    url.pathname ===
+      '/studio-ack'
+  ) {
+    const id =
+      String(
+        body?.requestId ||
+        body?.id ||
+        ''
+      );
+
+    if (id) {
+      doneStudio.add(id);
     }
-    sendJson(res, 200, { ok: true });
-    return;
+
+    for (
+      let i =
+        studioQueue.length - 1;
+      i >= 0;
+      i--
+    ) {
+      if (
+        studioQueue[i].id ===
+        id
+      ) {
+        studioQueue.splice(
+          i,
+          1
+        );
+      }
+    }
+
+    return json(
+      res,
+      200,
+      {
+        ok: true,
+
+        requestId:
+          id
+      }
+    );
   }
 
-  let provider;
-  if (url.pathname === '/gemini') {
-    provider = 'gemini';
-  } else if (url.pathname === '/gpt') {
-    provider = 'gpt';
-  } else {
-    provider = normalizeProvider(body?.provider);
+  if (
+    url.pathname !==
+      '/gpt' &&
+    url.pathname !==
+      '/gemini'
+  ) {
+    return json(
+      res,
+      404,
+      {
+        ok: false,
+
+        error:
+          'Endpoint tapılmadı.'
+      }
+    );
   }
 
-  if (url.pathname !== '/gpt' && url.pathname !== '/gemini') {
-    sendJson(res, 404, {
-      ok: false,
-      error: 'Endpoint tapılmadı. /gpt və ya /gemini istifadə edin.',
-    });
-    return;
-  }
+  const provider =
+    url.pathname ===
+      '/gemini'
+      ? 'gemini'
+      : 'gpt';
 
-  try {
-    const result = await processAI(provider, body);
-    const status = result.ok ? 200 : 200;
-    sendJson(res, status, result);
-  } catch (err) {
-    console.error('[SERVER ERROR]', err);
-    sendJson(res, 500, {
-      ok: false,
+  return json(
+    res,
+    200,
+    await processAI(
       provider,
-      reply: 'Server xətası baş verdi.',
-      actions: [],
-      error: err?.message || String(err),
-    });
+      body
+    )
+  );
+}
+
+const server =
+  http.createServer(
+    (
+      req,
+      res
+    ) => {
+      handler(
+        req,
+        res
+      ).catch(
+        e => {
+          console.error(
+            '[SERVER ERROR]',
+            e
+          );
+
+          if (
+            !res.headersSent
+          ) {
+            json(
+              res,
+              500,
+              {
+                ok:
+                  false,
+
+                error:
+                  e?.message ||
+                  String(e),
+
+                reply:
+                  'Server xətası baş verdi.',
+
+                actions:
+                  []
+              }
+            );
+          } else {
+            try {
+              res.end();
+            } catch {}
+          }
+        }
+      );
+    }
+  );
+
+server.on(
+  'clientError',
+  (
+    err,
+    socket
+  ) => {
+    try {
+      socket.end(
+        'HTTP/1.1 400 Bad Request\r\n\r\n'
+      );
+    } catch {}
   }
-});
+);
 
-server.on('clientError', (err, socket) => {
-  try {
-    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
-  } catch {}
-});
+server.listen(
+  PORT,
+  '0.0.0.0',
+  () => {
+    console.log(
+      '=============================================='
+    );
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('==============================================');
-  console.log(' Roblox AI Backend hazırdır');
-  console.log(' http://127.0.0.1:' + PORT + '/health');
-  console.log(' GPT endpoint:    http://127.0.0.1:' + PORT + '/gpt');
-  console.log(' Gemini endpoint: http://127.0.0.1:' + PORT + '/gemini');
-  console.log(' GPT model:       ' + OPENROUTER_MODEL);
-  console.log(' Gemini model:    ' + GEMINI_MODEL);
-  console.log(' OpenRouter key:  ' + (OPENROUTER_API_KEY ? 'OK' : 'YOOX'));
-  console.log(' Gemini key:      ' + (GEMINI_API_KEY ? 'OK' : 'YOOX'));
-  console.log('==============================================');
-});
+    console.log(
+      'Roblox AI Backend hazırdır'
+    );
 
-process.on('SIGINT', () => {
-  console.log('\nServer bağlanır...');
-  server.close(() => process.exit(0));
-});
+    console.log(
+      'Port:',
+      PORT
+    );
+
+    console.log(
+      'GPT:',
+      '/gpt'
+    );
+
+    console.log(
+      'Gemini:',
+      '/gemini'
+    );
+
+    console.log(
+      'Toolbox:',
+      '/toolbox-search'
+    );
+
+    console.log(
+      'Studio:',
+      '/studio-script'
+    );
+
+    console.log(
+      'OpenRouter key:',
+      OPENROUTER_API_KEY
+        ? 'OK'
+        : 'YOOX'
+    );
+
+    console.log(
+      'Gemini key:',
+      GEMINI_API_KEY
+        ? 'OK'
+        : 'YOOX'
+    );
+
+    console.log(
+      'Toolbox key:',
+      ROBLOX_TOOLBOX_API_KEY
+        ? 'OK'
+        : 'YOOX'
+    );
+
+    console.log(
+      '=============================================='
+    );
+  }
+);
+
+process.on(
+  'SIGINT',
+  () =>
+    server.close(
+      () =>
+        process.exit(0)
+    )
+);
