@@ -60,10 +60,10 @@ const ZENMUX_API_KEY = String(process.env.ZENMUX_API_KEY || '').trim();
 const ZENMUX_GROK_MODEL = String(process.env.ZENMUX_GROK_MODEL || 'x-ai/grok-4.6').trim();
 const ROBLOX_TOOLBOX_API_KEY = String(process.env.ROBLOX_TOOLBOX_API_KEY || '').trim();
 
-const MAX_HISTORY = 8;
-const MAX_MESSAGE_CHARS = 4000;
-const REQUEST_TIMEOUT_MS = 10000;
-const MAX_RETRIES = 0;
+const MAX_HISTORY = 12;
+const MAX_MESSAGE_CHARS = 5000;
+const REQUEST_TIMEOUT_MS = 25000;
+const MAX_RETRIES = 2;
 const MAX_BODY_BYTES = 1024 * 1024;
 
 const brains = new Map();
@@ -81,9 +81,9 @@ const lastProviderRequestAt = {
   grok: 0,
 };
 const MIN_GAP_MS = {
-  gpt: 0,
-  gemini: 150,
-  grok: 0,
+  gpt: 250,
+  gemini: 1200,
+  grok: 300,
 };
 
 function sleep(ms) {
@@ -149,6 +149,7 @@ function isActionMessage(message) {
     'izle', 'izlə', 'follow', 'tp', 'teleport', 'tullan', 'jump', 'dance',
     'reqs', 'rəqs', 'toolbox', 'model', 'masin', 'maşın', 'vehicle', 'car',
     'gey', 'geyin', 'wear', 'paltar', 'sil', 'remove', 'clear', 'edit',
+    'saldir', 'saldır', 'hucum', 'hücum', 'attack', 'atak', 'vur', 'silah', 'weapon', 'equip tool',
     'duzelt', 'düzəlt', 'outfit', 'script', 'server script', 'starterplayer', 'starterplayerscripts', 'localscript', 'local script', 'luau', 'kod yaz', 'script yaz', 'script sil', 'scripti sil', 'sil script', 'saga don', 'sağa dön', 'sola don',
     'sola dön', 'duz get', 'düz get', 'suret', 'sürət', 'takip', 'teqib', 'qucaq', 'hug', 'carry', 'dasima', 'qaldir', 'dans etdir', 'dance etdir', 'birlikde', 'birlikdə', 'dansimizi', 'danimizi', 'dans dayandir', 'dansi durdur', 'dansimizi durdur'
   ];
@@ -296,9 +297,24 @@ function pushHistory(brain, role, content) {
 }
 
 async function withProviderQueue(provider, fn) {
-  // V4 FAST: do not serialize all players behind one provider queue.
-  // Deterministic commands never reach this function.
-  return fn();
+  const previous = providerQueues[provider] || Promise.resolve();
+  let release;
+  providerQueues[provider] = new Promise(resolve => {
+    release = resolve;
+  });
+
+  try {
+    await previous;
+
+    const elapsed = Date.now() - lastProviderRequestAt[provider];
+    const wait = MIN_GAP_MS[provider] - elapsed;
+    if (wait > 0) await sleep(wait);
+
+    lastProviderRequestAt[provider] = Date.now();
+    return await fn();
+  } finally {
+    release();
+  }
 }
 
 async function fetchJson(url, options, label) {
@@ -375,6 +391,9 @@ function buildSystemPrompt({ provider, ownerName, world, assets, actionMode }) {
     '- Bir hərəkəti yerinə yetirmək üçün uyğun action qaytar.',
     '- Normal hərəkət teleport deyil; Roblox tərəfi WALK_TO, JUMP, FOLLOW və VEHICLE_DRIVE kimi fiziki icra etməlidir.',
     '- Dünya məlumatında maneə, player, model, maşın və digər obyektlər varsa, qərarında onlardan istifadə et.',
+    '- Açıq hücum əmri gəlirsə targetName və uyğun ATTACK action qaytar; yalnız mətnlə cavab vermə.',
+    '- ATTACK_PLAYER başqa oyunçunu, ATTACK_AI isə başqa AI rig-i hədəfləyir.',
+    '- Konkret Tool/silah adı verilirsə toolName sahəsini həmin adla doldur.',
   ].join('\n');
 
   let context = '';
@@ -398,13 +417,6 @@ Yalnız bu JSON formasında cavab ver:
   ]
 }
 
-FAST RULES:
-- Reply ən çox 80 simvol olsun.
-- İzah, markdown, kod bloku və əlavə mətn yazma.
-- Əmr aydındırsa birbaşa action qaytar.
-- Əmr icra olunmalıdır; yalnız cavab yazmaq kifayət deyil.
-- Sadə əmr üçün maksimum 1 action; ardıcıl əmrlər üçün maksimum 3 action qaytar.
-
 İcazəli action tipləri:
 STOP
 STOP_DANCE
@@ -415,6 +427,13 @@ COME
 TELEPORT
 JUMP
 DANCE
+DANCE_1
+DANCE_2
+DANCE_3
+DANCE_4
+DANCE_5
+DANCE_6
+DANCE_7
 DANCE_WITH_OWNER
 HUG
 CARRY
@@ -432,6 +451,12 @@ CLEAR_OUTFIT
 VEHICLE_ENTER
 VEHICLE_EXIT
 VEHICLE_DRIVE
+VEHICLE_STOP
+EQUIP_TOOL
+USE_TOOL
+ATTACK_PLAYER
+ATTACK_AI
+ATTACK
 STUDIO_SCRIPT_CREATE
 STUDIO_SCRIPT_DELETE
 
@@ -456,7 +481,7 @@ Vacib script qaydası:
 - Bütün AI scriptləri müvəqqətidir: AIEphemeral=true, deleteOnOwnerLeave=true, doNotPersist=true.
 
 FOLLOW: {"type":"FOLLOW","target":"player adı və ya OWNER"}
-DANCE_WITH_OWNER: {"type":"DANCE_WITH_OWNER","variant":1}
+DANCE_WITH_OWNER: {"type":"DANCE_WITH_OWNER"}
 HUG: {"type":"HUG"}
 CARRY: {"type":"CARRY"}
 DROP: {"type":"DROP"}
@@ -465,7 +490,12 @@ WALK_TO: {"type":"WALK_TO","position":[x,y,z],"distance":3}
 TURN: {"type":"TURN","direction":"LEFT|RIGHT","degrees":90}
 VEHICLE_ENTER: {"type":"VEHICLE_ENTER"}
 VEHICLE_EXIT: {"type":"VEHICLE_EXIT"}
-VEHICLE_DRIVE: {"type":"VEHICLE_DRIVE","aircraft":false,"direction":"forward","speed":30,"duration":15,"vertical":0}
+VEHICLE_DRIVE: {"type":"VEHICLE_DRIVE","target":"player adı və ya destination","follow":true}
+EQUIP_TOOL: {"type":"EQUIP_TOOL","toolName":"Tool/Silah adı"}
+USE_TOOL: {"type":"USE_TOOL","toolName":"Tool/Silah adı","duration":3,"cooldown":0.45}
+ATTACK_PLAYER: {"type":"ATTACK_PLAYER","targetName":"oyuncu adı","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
+ATTACK_AI: {"type":"ATTACK_AI","targetName":"GPT|Gemini|Grok və ya AI rig adı","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
+ATTACK: {"type":"ATTACK","targetName":"oyuncu və ya AI adı","targetType":"PLAYER|AI","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
 BUILD: {"type":"BUILD","name":"UserRequestedObject","description":"istifadəçinin bütün detalı","parts":[{"shape":"Block|Ball|Cylinder|Wedge","size":[4,1,4],"offset":[0,0,0],"material":"Plastic","color":[255,255,255],"anchored":true,"name":"Part"}]}
 TOOLBOX: {"type":"TOOLBOX","query":"specific decoration requested by user","count":1}
 WEAR: {"type":"WEAR","assetId":123}
@@ -568,11 +598,6 @@ function normalizeAction(action) {
   if (out.degrees !== undefined) out.degrees = Math.max(1, Math.min(360, Number(out.degrees) || 90));
   if (out.distance !== undefined) out.distance = Math.max(1, Math.min(100, Number(out.distance) || 3));
   if (out.count !== undefined) out.count = Math.max(1, Math.min(10, Number(out.count) || 1));
-  if (out.variant !== undefined) out.variant = Math.max(1, Math.min(7, Number(out.variant) || 7));
-  if (out.duration !== undefined) out.duration = Math.max(0.2, Math.min(90, Number(out.duration) || 10));
-  if (out.speed !== undefined) out.speed = Math.max(1, Math.min(100, Number(out.speed) || 30));
-  if (out.vertical !== undefined) out.vertical = Math.max(-1, Math.min(1, Number(out.vertical) || 0));
-  if (out.aircraft !== undefined) out.aircraft = out.aircraft === true;
   if (out.assetId !== undefined) out.assetId = Number(out.assetId) || 0;
 
   return out;
@@ -650,6 +675,37 @@ function localCommand(message) {
     m.includes('toolbox') ||
     m.includes('creator store') ||
     m.includes('creatorstore');
+
+  const attackRegexBefore = /^(.+?)\s+(saldir|saldır|hucum et|hücum et|attack|atak et|vur)(?:\s+ona)?$/i;
+  const attackRegexAfter = /^(saldir|saldır|hucum et|hücum et|attack|atak et|vur)\s+(.+)$/i;
+  const rawMessage = String(message || '').trim();
+  const am = rawMessage.match(attackRegexBefore) || rawMessage.match(attackRegexAfter);
+  if (am) {
+    let target = (am[2] || am[1] || '').trim();
+    target = target.replace(/^(basqa ai|başqa ai|basqa player|başqa player|ai|oyuncu|player)\s+/i, '');
+    target = target.replace(/[\-–—]?(?:y)?[əe]$/i, '').trim();
+    if (target) {
+      const nt = normalizeTextForCommand(target);
+      const isAI = nt === 'gpt' || nt === 'gemini' || nt === 'grok';
+      result.reply = isAI ? 'Oldu, həmin AI-yə hücum edirəm.' : 'Oldu, həmin oyunçuya hücum edirəm.';
+      result.actions = [{ type: isAI ? 'ATTACK_AI' : 'ATTACK_PLAYER', targetName: target, duration: 8, damage: 10 }];
+      return result;
+    }
+  }
+
+  if ((m.includes('silah') || m.includes('weapon') || m.includes('equip tool') || m.includes('toolu gotur') || m.includes('toolu götür')) &&
+      (m.includes('gotur') || m.includes('götür') || m.includes('equip') || m.includes('al'))) {
+    result.reply = 'Oldu, Tool-u AI-yə verdim.';
+    result.actions = [{ type: 'EQUIP_TOOL', toolName: '' }];
+    return result;
+  }
+
+  if (m.includes('toolu islet') || m.includes('toolu işlət') || m.includes('silahla vur') || m.includes('silahla attack')) {
+    result.reply = 'Oldu, Tool-u işlədib hücum edirəm.';
+    result.actions = [{ type: 'USE_TOOL', duration: 3 }];
+    return result;
+  }
+
   if (wantsToolbox) {
     let query = String(message || '').trim();
 
@@ -733,26 +789,6 @@ function localCommand(message) {
     return result;
   }
 
-  if (hasAny('ucagi sur', 'uçağı sür', 'ucagi ucur', 'uçağı uçur', 'ucaqi ucur', 'uçaqı uçur', 'teyyareni ucur', 'təyyarəni uçur', 'havaya qalx', 'uçuşa başla')) {
-    result.reply = 'Təyyarəni uçururam.';
-    result.actions = [{ type: 'VEHICLE_DRIVE', aircraft: true, duration: 15, speed: 42, vertical: 0.35 }];
-    return result;
-  }
-
-  if (hasAny('masina min', 'masına min', 'masina min', 'araba min', 'maşına min', 'vehicleda min', 'vehicle min', 'ucaga min', 'uçağa min', 'ucaga qalx', 'uçağa qalx', 'teyyareye min', 'təyyarəyə min')) {
-    const aircraft = m.includes('ucaq') || m.includes('uçaq') || m.includes('teyyare') || m.includes('təyyarə');
-    result.reply = aircraft ? 'Uçağa/təyyarəyə minirəm və uçuşa başlayıram.' : 'Maşına minib sürməyə başlayıram.';
-    result.actions = [{ type: 'VEHICLE_ENTER' }, { type: 'VEHICLE_DRIVE', aircraft }];
-    return result;
-  }
-
-  if (hasAny('masini sur', 'maşını sür', 'araba sur', 'araba sür', 'vehicle drive')) {
-    const aircraft = m.includes('ucaq') || m.includes('uçaq') || m.includes('teyyar') || m.includes('havaya');
-    result.reply = aircraft ? 'Uçuşu başladım.' : 'Maşını sürürəm.';
-    result.actions = [{ type: 'VEHICLE_DRIVE', aircraft, duration: 15, speed: aircraft ? 35 : 30, vertical: aircraft ? 0.15 : 0 }];
-    return result;
-  }
-
   if (hasAny('mene tp ol', 'mene tp ele', 'mene teleport ol', 'mene teleport et', 'meni tp et', 'meni teleport et', 'yanima tp ol')) {
     result.reply = 'Yanına teleport oldum.';
     result.actions = [{ type: 'TELEPORT' }];
@@ -765,11 +801,41 @@ function localCommand(message) {
     return result;
   }
 
-  const danceMatch = message.match(/^(?:rəqs|reqs|dans|dance)\s*([1-7])$/i);
+  // Explicit combat command: execute immediately, without waiting for model reasoning.
+  const attackPatterns = [
+    /(.+?)\s+(?:saldir|saldır|hucum et|hücum et|attack|vur|atak et)$/i,
+    /(?:saldir|saldır|hucum et|hücum et|attack|vur|atak et)\s+(.+)$/i
+  ];
+  for (const pattern of attackPatterns) {
+    const mm = String(message || '').trim().match(pattern);
+    if (!mm) continue;
+
+    let targetName = String(mm[1] || '').trim()
+      .replace(/^(basqa ai|başqa ai|ai|oyuncu|player)\s+/i, '')
+      .trim();
+
+    if (!targetName) continue;
+
+    const nt = normalizeTextForCommand(targetName);
+    const isAI = ['gpt','gemini','grok'].includes(nt) ||
+      m.includes('basqa ai') || m.includes('bashqa ai') || m.includes('başqa ai');
+
+    result.reply = isAI ? 'Oldu, həmin AI-yə hücum edirəm.' : 'Oldu, həmin oyunçuya hücum edirəm.';
+    result.actions = [{
+      type: isAI ? 'ATTACK_AI' : 'ATTACK_PLAYER',
+      targetName,
+      duration: 10,
+      damage: 10,
+      range: 8
+    }];
+    return result;
+  }
+
+  const danceMatch = m.match(/\b(?:dance|dans|reqs|rəqs)\s*([1-7])\b/i);
   if (danceMatch) {
-    const variant = Math.max(1, Math.min(7, Number(danceMatch[1])));
-    result.reply = 'Rəqs variantı ' + variant + ' başladı.';
-    result.actions = [{ type: 'DANCE', variant }];
+    const n = Math.max(1, Math.min(7, Number(danceMatch[1]) || 1));
+    result.reply = `Rəqs ${n} başladı!`;
+    result.actions = [{ type: `DANCE_${n}` }];
     return result;
   }
 
@@ -782,6 +848,12 @@ function localCommand(message) {
   if (hasAny('dans et', 'dance et', 'reqs et', 'rəqs et', 'dance', 'dans', 'reqs', 'rəqs')) {
     result.reply = 'Rəqs edirəm!';
     result.actions = [{ type: 'DANCE' }];
+    return result;
+  }
+
+  if (hasAny('silahi gotur','silahi götür','silah gotur','silah götür','toolu gotur','toolu götür','equip tool','silah al')) {
+    result.reply = 'Silahı götürürəm.';
+    result.actions = [{ type: 'EQUIP_TOOL', toolName: '' }];
     return result;
   }
 
@@ -800,6 +872,23 @@ function localCommand(message) {
   if (hasAny('burax meni', 'meni burax', 'birak meni', 'yere qoy meni', 'drop me', 'drop')) {
     result.reply = 'Oldu, buraxdım.';
     result.actions = [{ type: 'DROP' }];
+    return result;
+  }
+
+  const wantsAircraft = hasAny('ucaq', 'uçaq', 'ucagi', 'uçağı', 'teyyare', 'təyyarə', 'plane', 'aircraft', 'helicopter', 'helikopter');
+  if (hasAny('masini sur', 'maşını sür', 'avtomobili sur', 'avtomobili sür', 'car sur', 'car sür', 'vehicle drive', 'masini sur') && !wantsAircraft) {
+    result.reply = 'Maşını sürürəm.';
+    result.actions = [{ type: 'VEHICLE_DRIVE', duration: 20, throttle: 1, steer: 0, direction: 'forward', aircraft: false }];
+    return result;
+  }
+  if (hasAny('ucagi ucur', 'uçağı uçur', 'ucagi sur', 'uçağı sür', 'teyyareyi ucur', 'təyyarəni uçur', 'plane fly', 'fly plane', 'helikopteri ucur', 'helikopteri uçur') || (wantsAircraft && hasAny('sur', 'sür', 'ucur', 'uçur', 'fly', 'drive'))) {
+    result.reply = 'Uçuşa başladım.';
+    result.actions = [{ type: 'VEHICLE_DRIVE', duration: 25, throttle: 1, steer: 0, direction: 'forward', aircraft: true, vertical: 0.22, altitude: 0.22 }];
+    return result;
+  }
+  if (hasAny('masini saxla', 'maşını saxla', 'vehicle stop', 'uçağı saxla', 'ucagi saxla')) {
+    result.reply = 'Nəqliyyat dayandı.';
+    result.actions = [{ type: 'VEHICLE_STOP' }];
     return result;
   }
 
@@ -881,8 +970,8 @@ async function callGrok({ ownerName, message, history, world, assets }) {
       body: JSON.stringify({
         model: ZENMUX_GROK_MODEL,
         messages,
-        temperature: actionMode ? 0.15 : 0.65,
-        max_tokens: actionMode ? 1400 : 240,
+        temperature: 0.7,
+        max_tokens: actionMode ? 5000 : 500,
       }),
     },
     'ZenMux Grok'
@@ -928,8 +1017,8 @@ async function callGPT({ ownerName, message, history, world, assets }) {
       body: JSON.stringify({
         model: OPENAI_MODEL,
         messages,
-        temperature: actionMode ? 0.15 : 0.65,
-        max_tokens: actionMode ? 1400 : 240,
+        temperature: 0.7,
+        max_tokens: actionMode ? 5000 : 500,
       }),
     },
     'OpenAI'
@@ -989,8 +1078,8 @@ async function callGemini({ ownerName, message, history, world, assets }) {
         },
         contents,
         generationConfig: {
-          temperature: actionMode ? 0.15 : 0.65,
-          maxOutputTokens: actionMode ? 1400 : 240,
+          temperature: 0.7,
+          maxOutputTokens: actionMode ? 14000 : 500,
         },
       }),
     },
@@ -1089,7 +1178,7 @@ async function processAI(provider, body) {
     const result = await withProviderQueue(provider, () => call({
       ownerName,
       message,
-      history: isActionMessage(message) ? [] : brain.history.slice(0, -1),
+      history: brain.history.slice(0, -1),
       world,
       assets,
     }));
@@ -1162,7 +1251,6 @@ function sendJson(res, status, payload) {
   const data = JSON.stringify(payload);
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Connection', 'keep-alive');
   res.setHeader('Content-Length', Buffer.byteLength(data));
   res.end(data);
 }
