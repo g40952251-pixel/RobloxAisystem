@@ -1,11 +1,10 @@
 'use strict';
 
-// Roblox GPT + Gemini + Grok AI Backend
+// Roblox GPT + Gemini AI Backend
 // Node.js 18+
 // .env:
 // OPENROUTER_API_KEY=...
 // GEMINI_API_KEY=...
-// XAI_API_KEY=...
 // PORT=3000
 
 const http = require('http');
@@ -54,8 +53,8 @@ const OPENROUTER_MODEL = String(process.env.OPENROUTER_MODEL || 'openrouter/free
 const GEMINI_MODEL = String(process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite').trim();
 const OPENROUTER_API_KEY = String(process.env.OPENROUTER_API_KEY || '').trim();
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
-const XAI_API_KEY = String(process.env.XAI_API_KEY || '').trim();
-const XAI_MODEL = String(process.env.XAI_MODEL || 'grok-4.6').trim();
+const ZENMUX_API_KEY = String(process.env.ZENMUX_API_KEY || '').trim();
+const ZENMUX_GROK_MODEL = String(process.env.ZENMUX_GROK_MODEL || 'x-ai/grok-4.6').trim();
 const ROBLOX_TOOLBOX_API_KEY = String(process.env.ROBLOX_TOOLBOX_API_KEY || '').trim();
 
 const MAX_HISTORY = 12;
@@ -81,7 +80,7 @@ const lastProviderRequestAt = {
 const MIN_GAP_MS = {
   gpt: 250,
   gemini: 1200,
-  grok: 500,
+  grok: 300,
 };
 
 function sleep(ms) {
@@ -99,13 +98,7 @@ function clampText(value, max = MAX_MESSAGE_CHARS) {
 function normalizeProvider(value) {
   const s = String(value || '').toLowerCase();
   const compact = s.split(' ').join('').split('_').join('').split('-').join('');
-  if (
-    compact.includes('grok') ||
-    compact.includes('gork') ||
-    compact.includes('grokk')
-  ) {
-    return 'grok';
-  }
+
   if (
     compact.includes('gemini') ||
     compact.includes('gemni') ||
@@ -114,6 +107,15 @@ function normalizeProvider(value) {
   ) {
     return 'gemini';
   }
+
+  if (
+    compact === 'grok' ||
+    compact.includes('grok') ||
+    compact.includes('gork')
+  ) {
+    return 'grok';
+  }
+
   return 'gpt';
 }
 
@@ -368,7 +370,7 @@ async function fetchJson(url, options, label) {
 }
 
 function buildSystemPrompt({ provider, ownerName, world, assets, actionMode }) {
-  const aiName = provider === 'grok' ? 'Grok' : (provider === 'gemini' ? 'Gemini' : 'GPT');
+  const aiName = provider === 'gemini' ? 'Gemini' : provider === 'grok' ? 'Grok' : 'GPT';
 
   const base = [
     'Sən Roblox oyununda yaşayan müstəqil AI NPC-sən.',
@@ -378,9 +380,9 @@ function buildSystemPrompt({ provider, ownerName, world, assets, actionMode }) {
     'Qaydalar:',
     '- Cavabı əsasən Azərbaycan dilində ver.',
     '- Təbii, qısa və konkret danış.',
-    '- Cavaba User:, Sage:, GPT:, Gemini:, Grok: və ya [GPT]/[Gemini]/[Grok] kimi ad etiketi əlavə etmə.',
+    '- Cavaba User:, Sage:, GPT:, Gemini: və ya [GPT]/[Gemini] kimi ad etiketi əlavə etmə.',
     '- Roblox dünyasını nəzərə al.',
-    '- GPT, Gemini və Grok ayrı AI-lardır; yaddaşlarını qarışdırma.',
+    '- GPT və Gemini ayrı AI-lardır; yaddaşlarını qarışdırma.',
     '- Başqa AI-ların mövcudluğunu dünya məlumatından görə bilərsən.',
     '- Bir hərəkəti yerinə yetirmək üçün uyğun action qaytar.',
     '- Normal hərəkət teleport deyil; Roblox tərəfi WALK_TO, JUMP, FOLLOW və VEHICLE_DRIVE kimi fiziki icra etməlidir.',
@@ -817,6 +819,58 @@ function localCommand(message) {
   return null;
 }
 
+async function callGrok({ ownerName, message, history, world, assets }) {
+  if (!ZENMUX_API_KEY) {
+    throw Object.assign(
+      new Error('ZENMUX_API_KEY tapilmadi.'),
+      { status: 401 }
+    );
+  }
+
+  const actionMode = isActionMessage(message);
+  const system = buildSystemPrompt({
+    provider: 'grok',
+    ownerName,
+    world: actionMode ? compactWorld(world) : null,
+    assets: actionMode ? compactAssets(assets) : [],
+    actionMode,
+  });
+
+  const messages = [
+    { role: 'system', content: system },
+    ...history.slice(-MAX_HISTORY),
+    { role: 'user', content: clampText(message) },
+  ];
+
+  const data = await fetchJson(
+    'https://zenmux.ai/api/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + ZENMUX_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: ZENMUX_GROK_MODEL,
+        messages,
+        temperature: 0.7,
+        max_tokens: actionMode ? 14000 : 500,
+      }),
+    },
+    'ZenMux Grok'
+  );
+
+  const content = data?.choices?.[0]?.message?.content;
+
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new Error(
+      'ZenMux Grok boş cavab qaytardı.'
+    );
+  }
+
+  return normalizeModelOutput(content);
+}
+
 async function callGPT({ ownerName, message, history, world, assets }) {
   if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY tapilmadi.');
 
@@ -857,50 +911,6 @@ async function callGPT({ ownerName, message, history, world, assets }) {
   const content = data?.choices?.[0]?.message?.content;
   if (typeof content !== 'string' || !content.trim()) {
     throw new Error('OpenRouter boş cavab qaytardı.');
-  }
-
-  return normalizeModelOutput(content);
-}
-
-async function callGrok({ ownerName, message, history, world, assets }) {
-  if (!XAI_API_KEY) throw new Error('XAI_API_KEY tapilmadi.');
-
-  const actionMode = isActionMessage(message);
-  const system = buildSystemPrompt({
-    provider: 'grok',
-    ownerName,
-    world: actionMode ? compactWorld(world) : null,
-    assets: actionMode ? compactAssets(assets) : [],
-    actionMode,
-  });
-
-  const messages = [
-    { role: 'system', content: system },
-    ...history.slice(-MAX_HISTORY),
-    { role: 'user', content: clampText(message) },
-  ];
-
-  const data = await fetchJson(
-    'https://api.x.ai/v1/chat/completions',
-    {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + XAI_API_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: XAI_MODEL,
-        messages,
-        temperature: 0.7,
-        max_tokens: actionMode ? 14000 : 700,
-      }),
-    },
-    'xAI Grok'
-  );
-
-  const content = data?.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || !content.trim()) {
-    throw new Error('Grok boş cavab qaytardı.');
   }
 
   return normalizeModelOutput(content);
@@ -1045,7 +1055,7 @@ async function processAI(provider, body) {
 
   const world = safeBody.world || safeBody.worldSnapshot || null;
   const assets = safeBody.assets || safeBody.availableAssets || [];
-  const call = provider === 'grok' ? callGrok : (provider === 'gemini' ? callGemini : callGPT);
+  const call = provider === 'gemini' ? callGemini : provider === 'grok' ? callGrok : callGPT;
 
   pushHistory(brain, 'user', message);
 
@@ -1077,24 +1087,24 @@ async function processAI(provider, body) {
     }
 
     const status = Number(err?.status || 500);
-    let reply = provider === 'grok'
-      ? 'Grok hazırda cavab verə bilmədi.'
-      : (provider === 'gemini'
-        ? 'Gemini hazırda cavab verə bilmədi.'
-        : 'GPT hazırda cavab verə bilmədi.');
+    let reply = provider === 'gemini'
+      ? 'Gemini hazırda cavab verə bilmədi.'
+      : provider === 'grok'
+        ? 'Grok cavab verə bilmədi.'
+        : 'GPT hazırda cavab verə bilmədi.';
 
     if (status === 429) {
-      reply = provider === 'grok'
-        ? 'Grok sorğu limitinə çatdı. Bir az sonra yenidən yoxla.'
-        : (provider === 'gemini'
-          ? 'Gemini sorğu limitinə çatdı. Bir az sonra yenidən yoxla.'
-          : 'GPT sorğu limitinə çatdı. Bir az sonra yenidən yoxla.');
+      reply = provider === 'gemini'
+        ? 'Gemini sorğu limitinə çatdı. Bir az sonra yenidən yoxla.'
+        : provider === 'grok'
+          ? 'Grok sorğu limitinə çatdı. Bir az sonra yenidən yoxla.'
+          : 'GPT sorğu limitinə çatdı. Bir az sonra yenidən yoxla.';
     } else if (status === 401 || status === 403) {
-      reply = provider === 'grok'
-        ? 'Grok API açarı qəbul edilmədi.'
-        : (provider === 'gemini'
-          ? 'Gemini API açarı qəbul edilmədi.'
-          : 'OpenRouter API açarı qəbul edilmədi.');
+      reply = provider === 'gemini'
+        ? 'Gemini API açarı qəbul edilmədi.'
+        : provider === 'grok'
+          ? 'ZenMux API açarı qəbul edilmədi.'
+          : 'OpenRouter API açarı qəbul edilmədi.';
     } else if (status === 400) {
       reply = 'AI sorğusunun formatında problem var.';
     }
@@ -1295,17 +1305,17 @@ async function generateStudioSource({ provider, prompt, ownerUserId, targetServi
     'Honor every detail in the user request.',
   ].join('\n');
 
-  if (provider === 'grok' && XAI_API_KEY) {
+  if (provider === 'grok' && ZENMUX_API_KEY) {
     const data = await fetchJson(
-      'https://api.x.ai/v1/chat/completions',
+      'https://zenmux.ai/api/v1/chat/completions',
       {
         method: 'POST',
         headers: {
-          'Authorization': 'Bearer ' + XAI_API_KEY,
+          Authorization: 'Bearer ' + ZENMUX_API_KEY,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: XAI_MODEL,
+          model: ZENMUX_GROK_MODEL,
           messages: [
             { role: 'system', content: system },
             { role: 'user', content: prompt },
@@ -1314,10 +1324,14 @@ async function generateStudioSource({ provider, prompt, ownerUserId, targetServi
           max_tokens: 5000,
         }),
       },
-      'xAI Grok Studio'
+      'ZenMux Grok Studio'
     );
+
     const raw = data?.choices?.[0]?.message?.content || '';
-    return String(raw).replace(/^```(?:lua|luau)?\s*/i, '').replace(/\s*```$/i, '').trim();
+    return String(raw)
+      .replace(/^```(?:lua|luau)?\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim();
   }
 
   if (provider === 'gemini' && GEMINI_API_KEY) {
@@ -1563,12 +1577,12 @@ const server = http.createServer(async (req, res) => {
       models: {
         gpt: OPENROUTER_MODEL,
         gemini: GEMINI_MODEL,
-        grok: XAI_MODEL,
+        grok: ZENMUX_GROK_MODEL,
       },
       keys: {
         openrouter: Boolean(OPENROUTER_API_KEY),
         gemini: Boolean(GEMINI_API_KEY),
-        grok: Boolean(XAI_API_KEY),
+        grok: Boolean(ZENMUX_API_KEY),
         robloxToolbox: Boolean(ROBLOX_TOOLBOX_API_KEY),
       },
       brains: brains.size,
@@ -1582,6 +1596,37 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       items: studioQueue.filter(x => !studioCompleted.has(x.id)).slice(0, 10),
     });
+    return;
+  }
+
+  // Toolbox search is GET and must be handled BEFORE the generic POST guard.
+  if (req.method === 'GET' && url.pathname === '/toolbox-search') {
+    try {
+      const query = String(url.searchParams.get('query') || '').trim();
+      const limit = Number(url.searchParams.get('limit') || 25);
+
+      if (!query) {
+        sendJson(res, 400, {
+          ok: false,
+          error: 'Toolbox query boşdur.',
+        });
+        return;
+      }
+
+      const results = await searchRobloxToolbox(query, limit);
+
+      sendJson(res, 200, {
+        ok: true,
+        results,
+      });
+    } catch (err) {
+      console.error('[TOOLBOX SEARCH ERROR]', err);
+      sendJson(res, 500, {
+        ok: false,
+        error: err?.message || String(err),
+        hasKey: Boolean(ROBLOX_TOOLBOX_API_KEY),
+      });
+    }
     return;
   }
 
@@ -1602,28 +1647,6 @@ const server = http.createServer(async (req, res) => {
       reply: 'Sorğu oxunmadı.',
       error: err?.message || String(err),
     });
-    return;
-  }
-
-  if (req.method === 'GET' && url.pathname === '/toolbox-search') {
-    try {
-      const query = String(url.searchParams.get('query') || '').trim();
-      const limit = Number(url.searchParams.get('limit') || 25);
-      if (!query) {
-        sendJson(res, 400, { ok: false, error: 'Toolbox query boşdur.' });
-        return;
-      }
-
-      const results = await searchRobloxToolbox(query, limit);
-      sendJson(res, 200, { ok: true, results });
-    } catch (err) {
-      console.error('[TOOLBOX SEARCH ERROR]', err);
-      sendJson(res, 500, {
-        ok: false,
-        error: err?.message || String(err),
-        hasKey: Boolean(ROBLOX_TOOLBOX_API_KEY),
-      });
-    }
     return;
   }
 
@@ -1652,10 +1675,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   let provider;
-  if (url.pathname === '/grok') {
-    provider = 'grok';
-  } else if (url.pathname === '/gemini') {
+  if (url.pathname === '/gemini') {
     provider = 'gemini';
+  } else if (url.pathname === '/grok') {
+    provider = 'grok';
   } else if (url.pathname === '/gpt') {
     provider = 'gpt';
   } else {
@@ -1698,13 +1721,13 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(' http://127.0.0.1:' + PORT + '/health');
   console.log(' GPT endpoint:    http://127.0.0.1:' + PORT + '/gpt');
   console.log(' Gemini endpoint: http://127.0.0.1:' + PORT + '/gemini');
-  console.log(' Grok endpoint:    http://127.0.0.1:' + PORT + '/grok');
+  console.log(' Grok endpoint:   http://127.0.0.1:' + PORT + '/grok');
   console.log(' GPT model:       ' + OPENROUTER_MODEL);
   console.log(' Gemini model:    ' + GEMINI_MODEL);
-  console.log(' Grok model:      ' + XAI_MODEL);
+  console.log(' Grok model:      ' + ZENMUX_GROK_MODEL);
   console.log(' OpenRouter key:  ' + (OPENROUTER_API_KEY ? 'OK' : 'YOOX'));
   console.log(' Gemini key:      ' + (GEMINI_API_KEY ? 'OK' : 'YOOX'));
-  console.log(' Grok key:        ' + (XAI_API_KEY ? 'OK' : 'YOOX'));
+  console.log(' ZenMux Grok key: ' + (ZENMUX_API_KEY ? 'OK' : 'YOOX'));
   console.log('==============================================');
 });
 
