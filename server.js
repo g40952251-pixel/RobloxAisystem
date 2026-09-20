@@ -1,10 +1,13 @@
 'use strict';
 
-// Roblox GPT + Gemini AI Backend
+// Roblox OpenAI + Gemini + Grok AI Backend
 // Node.js 18+
 // .env:
-// OPENROUTER_API_KEY=...
+// OPENAI_API_KEY=...
+// OPENAI_MODEL=gpt-5.2
 // GEMINI_API_KEY=...
+// ZENMUX_API_KEY=...
+// ZENMUX_GROK_MODEL=x-ai/grok-4.6
 // PORT=3000
 
 const http = require('http');
@@ -49,9 +52,9 @@ function loadDotEnv() {
 loadDotEnv();
 
 const PORT = Number(process.env.PORT || 3000);
-const OPENROUTER_MODEL = String(process.env.OPENROUTER_MODEL || 'openrouter/free').trim();
+const OPENAI_MODEL = String(process.env.OPENAI_MODEL || 'gpt-5.2').trim();
 const GEMINI_MODEL = String(process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite').trim();
-const OPENROUTER_API_KEY = String(process.env.OPENROUTER_API_KEY || '').trim();
+const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
 const ZENMUX_API_KEY = String(process.env.ZENMUX_API_KEY || '').trim();
 const ZENMUX_GROK_MODEL = String(process.env.ZENMUX_GROK_MODEL || 'x-ai/grok-4.6').trim();
@@ -872,7 +875,7 @@ async function callGrok({ ownerName, message, history, world, assets }) {
 }
 
 async function callGPT({ ownerName, message, history, world, assets }) {
-  if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY tapilmadi.');
+  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY tapilmadi.');
 
   const actionMode = isActionMessage(message);
   const system = buildSystemPrompt({
@@ -884,38 +887,36 @@ async function callGPT({ ownerName, message, history, world, assets }) {
   });
 
   const messages = [
-    { role: 'system', content: system },
+    { role: 'developer', content: system },
     ...history.slice(-MAX_HISTORY),
     { role: 'user', content: clampText(message) },
   ];
 
   const data = await fetchJson(
-    'https://openrouter.ai/api/v1/chat/completions',
+    'https://api.openai.com/v1/chat/completions',
     {
       method: 'POST',
       headers: {
-        'Authorization': 'Bearer ' + OPENROUTER_API_KEY,
+        'Authorization': 'Bearer ' + OPENAI_API_KEY,
         'Content-Type': 'application/json',
-        'X-Title': 'Roblox Independent AI NPC',
       },
       body: JSON.stringify({
-        model: OPENROUTER_MODEL,
+        model: OPENAI_MODEL,
         messages,
         temperature: 0.7,
         max_tokens: actionMode ? 14000 : 500,
       }),
     },
-    'OpenRouter'
+    'OpenAI'
   );
 
   const content = data?.choices?.[0]?.message?.content;
   if (typeof content !== 'string' || !content.trim()) {
-    throw new Error('OpenRouter boş cavab qaytardı.');
+    throw new Error('OpenAI boş cavab qaytardı.');
   }
 
   return normalizeModelOutput(content);
 }
-
 async function callGemini({ ownerName, message, history, world, assets }) {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY tapilmadi.');
 
@@ -1104,7 +1105,7 @@ async function processAI(provider, body) {
         ? 'Gemini API açarı qəbul edilmədi.'
         : provider === 'grok'
           ? 'ZenMux API açarı qəbul edilmədi.'
-          : 'OpenRouter API açarı qəbul edilmədi.';
+          : 'OpenAI API açarı qəbul edilmədi.';
     } else if (status === 400) {
       reply = 'AI sorğusunun formatında problem var.';
     }
@@ -1356,27 +1357,26 @@ async function generateStudioSource({ provider, prompt, ownerUserId, targetServi
     return raw.replace(/^```(?:lua|luau)?\s*/i, '').replace(/\s*```$/i, '').trim();
   }
 
-  if (provider === 'gpt' && OPENROUTER_API_KEY) {
+  if (provider === 'gpt' && OPENAI_API_KEY) {
     const data = await fetchJson(
-      'https://openrouter.ai/api/v1/chat/completions',
+      'https://api.openai.com/v1/chat/completions',
       {
         method: 'POST',
         headers: {
-          Authorization: 'Bearer ' + OPENROUTER_API_KEY,
+          Authorization: 'Bearer ' + OPENAI_API_KEY,
           'Content-Type': 'application/json',
-          'X-Title': 'Roblox AI Studio Writer',
         },
         body: JSON.stringify({
-          model: OPENROUTER_MODEL,
+          model: OPENAI_MODEL,
           messages: [
-            { role: 'system', content: system },
+            { role: 'developer', content: system },
             { role: 'user', content: prompt },
           ],
           temperature: 0.12,
           max_tokens: 5000,
         }),
       },
-      'OpenRouter Studio'
+      'OpenAI Studio'
     );
     const raw = data?.choices?.[0]?.message?.content || '';
     return String(raw).replace(/^```(?:lua|luau)?\s*/i, '').replace(/\s*```$/i, '').trim();
@@ -1575,12 +1575,12 @@ const server = http.createServer(async (req, res) => {
       message: 'Roblox AI backend işləyir.',
       port: PORT,
       models: {
-        gpt: OPENROUTER_MODEL,
+        gpt: OPENAI_MODEL,
         gemini: GEMINI_MODEL,
         grok: ZENMUX_GROK_MODEL,
       },
       keys: {
-        openrouter: Boolean(OPENROUTER_API_KEY),
+        openai: Boolean(OPENAI_API_KEY),
         gemini: Boolean(GEMINI_API_KEY),
         grok: Boolean(ZENMUX_API_KEY),
         robloxToolbox: Boolean(ROBLOX_TOOLBOX_API_KEY),
@@ -1722,10 +1722,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(' GPT endpoint:    http://127.0.0.1:' + PORT + '/gpt');
   console.log(' Gemini endpoint: http://127.0.0.1:' + PORT + '/gemini');
   console.log(' Grok endpoint:   http://127.0.0.1:' + PORT + '/grok');
-  console.log(' GPT model:       ' + OPENROUTER_MODEL);
+  console.log(' OpenAI model:     ' + OPENAI_MODEL);
   console.log(' Gemini model:    ' + GEMINI_MODEL);
   console.log(' Grok model:      ' + ZENMUX_GROK_MODEL);
-  console.log(' OpenRouter key:  ' + (OPENROUTER_API_KEY ? 'OK' : 'YOOX'));
+  console.log(' OpenAI key:       ' + (OPENAI_API_KEY ? 'OK' : 'YOOX'));
   console.log(' Gemini key:      ' + (GEMINI_API_KEY ? 'OK' : 'YOOX'));
   console.log(' ZenMux Grok key: ' + (ZENMUX_API_KEY ? 'OK' : 'YOOX'));
   console.log('==============================================');
