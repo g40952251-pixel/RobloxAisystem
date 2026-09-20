@@ -423,13 +423,6 @@ COME
 TELEPORT
 JUMP
 DANCE
-DANCE_1
-DANCE_2
-DANCE_3
-DANCE_4
-DANCE_5
-DANCE_6
-DANCE_7
 DANCE_WITH_OWNER
 HUG
 CARRY
@@ -446,7 +439,8 @@ CLEAR
 CLEAR_OUTFIT
 VEHICLE_ENTER
 VEHICLE_EXIT
-VEHICLE_DRIVESTUDIO_SCRIPT_CREATE
+VEHICLE_DRIVE
+STUDIO_SCRIPT_CREATE
 STUDIO_SCRIPT_DELETE
 
 STUDIO_SCRIPT_CREATE:
@@ -470,7 +464,7 @@ Vacib script qaydası:
 - Bütün AI scriptləri müvəqqətidir: AIEphemeral=true, deleteOnOwnerLeave=true, doNotPersist=true.
 
 FOLLOW: {"type":"FOLLOW","target":"player adı və ya OWNER"}
-DANCE_WITH_OWNER: {"type":"DANCE_WITH_OWNER"}
+DANCE_WITH_OWNER: {"type":"DANCE_WITH_OWNER","variant":1}
 HUG: {"type":"HUG"}
 CARRY: {"type":"CARRY"}
 DROP: {"type":"DROP"}
@@ -479,7 +473,7 @@ WALK_TO: {"type":"WALK_TO","position":[x,y,z],"distance":3}
 TURN: {"type":"TURN","direction":"LEFT|RIGHT","degrees":90}
 VEHICLE_ENTER: {"type":"VEHICLE_ENTER"}
 VEHICLE_EXIT: {"type":"VEHICLE_EXIT"}
-VEHICLE_DRIVE: {"type":"VEHICLE_DRIVE","target":"player adı və ya destination","follow":true}
+VEHICLE_DRIVE: {"type":"VEHICLE_DRIVE","aircraft":false,"direction":"forward","speed":30,"duration":15,"vertical":0}
 BUILD: {"type":"BUILD","name":"UserRequestedObject","description":"istifadəçinin bütün detalı","parts":[{"shape":"Block|Ball|Cylinder|Wedge","size":[4,1,4],"offset":[0,0,0],"material":"Plastic","color":[255,255,255],"anchored":true,"name":"Part"}]}
 TOOLBOX: {"type":"TOOLBOX","query":"specific decoration requested by user","count":1}
 WEAR: {"type":"WEAR","assetId":123}
@@ -582,6 +576,11 @@ function normalizeAction(action) {
   if (out.degrees !== undefined) out.degrees = Math.max(1, Math.min(360, Number(out.degrees) || 90));
   if (out.distance !== undefined) out.distance = Math.max(1, Math.min(100, Number(out.distance) || 3));
   if (out.count !== undefined) out.count = Math.max(1, Math.min(10, Number(out.count) || 1));
+  if (out.variant !== undefined) out.variant = Math.max(1, Math.min(7, Number(out.variant) || 7));
+  if (out.duration !== undefined) out.duration = Math.max(0.2, Math.min(90, Number(out.duration) || 10));
+  if (out.speed !== undefined) out.speed = Math.max(1, Math.min(100, Number(out.speed) || 30));
+  if (out.vertical !== undefined) out.vertical = Math.max(-1, Math.min(1, Number(out.vertical) || 0));
+  if (out.aircraft !== undefined) out.aircraft = out.aircraft === true;
   if (out.assetId !== undefined) out.assetId = Number(out.assetId) || 0;
 
   return out;
@@ -659,7 +658,6 @@ function localCommand(message) {
     m.includes('toolbox') ||
     m.includes('creator store') ||
     m.includes('creatorstore');
-
   if (wantsToolbox) {
     let query = String(message || '').trim();
 
@@ -743,6 +741,20 @@ function localCommand(message) {
     return result;
   }
 
+  if (hasAny('masina min', 'masına min', 'masina min', 'araba min', 'maşına min', 'vehicleda min', 'vehicle min', 'ucaga min', 'uçağa min', 'ucaga qalx', 'uçağa qalx', 'teyyareye min', 'təyyarəyə min')) {
+    const aircraft = m.includes('ucaq') || m.includes('uçaq') || m.includes('teyyare') || m.includes('təyyarə');
+    result.reply = aircraft ? 'Uçağa/təyyarəyə minirəm və uçuşa başlayıram.' : 'Maşına minib sürməyə başlayıram.';
+    result.actions = [{ type: 'VEHICLE_ENTER' }, { type: 'VEHICLE_DRIVE', aircraft }];
+    return result;
+  }
+
+  if (hasAny('masini sur', 'maşını sür', 'masini sur', 'araba sur', 'vehicle drive', 'ucagi sur', 'uçağı sür', 'teyyareni sur', 'təyyarəni sür', 'ucaga qalx', 'uçağa qalx', 'havaya qalx')) {
+    const aircraft = m.includes('ucaq') || m.includes('uçaq') || m.includes('teyyar') || m.includes('havaya');
+    result.reply = aircraft ? 'Uçuşu başladım.' : 'Maşını sürürəm.';
+    result.actions = [{ type: 'VEHICLE_DRIVE', aircraft, duration: 15, speed: aircraft ? 35 : 30, vertical: aircraft ? 0.15 : 0 }];
+    return result;
+  }
+
   if (hasAny('mene tp ol', 'mene tp ele', 'mene teleport ol', 'mene teleport et', 'meni tp et', 'meni teleport et', 'yanima tp ol')) {
     result.reply = 'Yanına teleport oldum.';
     result.actions = [{ type: 'TELEPORT' }];
@@ -755,41 +767,23 @@ function localCommand(message) {
     return result;
   }
 
+  const danceMatch = rawMessage.match(/^(?:rəqs|reqs|dans|dance)\s*([1-7])$/i);
+  if (danceMatch) {
+    const variant = Math.max(1, Math.min(7, Number(danceMatch[1])));
+    result.reply = 'Rəqs variantı ' + variant + ' başladı.';
+    result.actions = [{ type: 'DANCE', variant }];
+    return result;
+  }
+
   if (hasAny('meni de dans etdir', 'meni de reqs etdir', 'məni də rəqs etdir', 'menimle dans et', 'menimle dance et', 'menimle reqs et', 'menimlə rəqs et', 'birlikde dans', 'birlikdə rəqs')) {
     result.reply = 'Oldu, birlikdə rəqs edirik!';
     result.actions = [{ type: 'DANCE_WITH_OWNER' }];
     return result;
   }
 
-  const danceMatch = m.match(/(?:dance|dans|reqs|rəqs)\s*([1-7])$/);
-  if (danceMatch) {
-    const idx = Number(danceMatch[1]);
-    result.reply = `Rəqs ${idx} edirəm!`;
-    result.actions = [{ type: `DANCE_${idx}` }];
-    return result;
-  }
-
   if (hasAny('dans et', 'dance et', 'reqs et', 'rəqs et', 'dance', 'dans', 'reqs', 'rəqs')) {
     result.reply = 'Rəqs edirəm!';
     result.actions = [{ type: 'DANCE' }];
-    return result;
-  }
-
-  if (hasAny('masina min', 'maşına min', 'masina minsın', 'arabaya min', 'vehicle enter', 'car enter', 'masin enter')) {
-    result.reply = 'Maşına mindim.';
-    result.actions = [{ type: 'VEHICLE_ENTER' }];
-    return result;
-  }
-
-  if (hasAny('masindan dus', 'maşından düş', 'arabadan dus', 'vehicle exit', 'car exit')) {
-    result.reply = 'Maşından düşdüm.';
-    result.actions = [{ type: 'VEHICLE_EXIT' }];
-    return result;
-  }
-
-  if (hasAny('masin sur', 'masini sur', 'maşın sür', 'maşını sür', 'araba sur', 'arabayi sur', 'arabayı sür', 'vehicle drive', 'car drive')) {
-    result.reply = 'Maşını sürürəm.';
-    result.actions = [{ type: 'VEHICLE_DRIVE', duration: 12, throttle: 1, steer: 0, direction: 'forward' }];
     return result;
   }
 
