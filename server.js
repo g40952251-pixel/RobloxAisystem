@@ -149,7 +149,6 @@ function isActionMessage(message) {
     'izle', 'izlə', 'follow', 'tp', 'teleport', 'tullan', 'jump', 'dance',
     'reqs', 'rəqs', 'toolbox', 'model', 'masin', 'maşın', 'vehicle', 'car',
     'gey', 'geyin', 'wear', 'paltar', 'sil', 'remove', 'clear', 'edit',
-    'saldir', 'saldır', 'hucum', 'hücum', 'attack', 'atak', 'vur', 'silah', 'weapon', 'equip tool',
     'duzelt', 'düzəlt', 'outfit', 'script', 'server script', 'starterplayer', 'starterplayerscripts', 'localscript', 'local script', 'luau', 'kod yaz', 'script yaz', 'script sil', 'scripti sil', 'sil script', 'saga don', 'sağa dön', 'sola don',
     'sola dön', 'duz get', 'düz get', 'suret', 'sürət', 'takip', 'teqib', 'qucaq', 'hug', 'carry', 'dasima', 'qaldir', 'dans etdir', 'dance etdir', 'birlikde', 'birlikdə', 'dansimizi', 'danimizi', 'dans dayandir', 'dansi durdur', 'dansimizi durdur'
   ];
@@ -391,9 +390,6 @@ function buildSystemPrompt({ provider, ownerName, world, assets, actionMode }) {
     '- Bir hərəkəti yerinə yetirmək üçün uyğun action qaytar.',
     '- Normal hərəkət teleport deyil; Roblox tərəfi WALK_TO, JUMP, FOLLOW və VEHICLE_DRIVE kimi fiziki icra etməlidir.',
     '- Dünya məlumatında maneə, player, model, maşın və digər obyektlər varsa, qərarında onlardan istifadə et.',
-    '- Açıq hücum əmri gəlirsə targetName və uyğun ATTACK action qaytar; yalnız mətnlə cavab vermə.',
-    '- ATTACK_PLAYER başqa oyunçunu, ATTACK_AI isə başqa AI rig-i hədəfləyir.',
-    '- Konkret Tool/silah adı verilirsə toolName sahəsini həmin adla doldur.',
   ].join('\n');
 
   let context = '';
@@ -427,6 +423,13 @@ COME
 TELEPORT
 JUMP
 DANCE
+DANCE_1
+DANCE_2
+DANCE_3
+DANCE_4
+DANCE_5
+DANCE_6
+DANCE_7
 DANCE_WITH_OWNER
 HUG
 CARRY
@@ -443,13 +446,7 @@ CLEAR
 CLEAR_OUTFIT
 VEHICLE_ENTER
 VEHICLE_EXIT
-VEHICLE_DRIVE
-EQUIP_TOOL
-USE_TOOL
-ATTACK_PLAYER
-ATTACK_AI
-ATTACK
-STUDIO_SCRIPT_CREATE
+VEHICLE_DRIVESTUDIO_SCRIPT_CREATE
 STUDIO_SCRIPT_DELETE
 
 STUDIO_SCRIPT_CREATE:
@@ -483,11 +480,6 @@ TURN: {"type":"TURN","direction":"LEFT|RIGHT","degrees":90}
 VEHICLE_ENTER: {"type":"VEHICLE_ENTER"}
 VEHICLE_EXIT: {"type":"VEHICLE_EXIT"}
 VEHICLE_DRIVE: {"type":"VEHICLE_DRIVE","target":"player adı və ya destination","follow":true}
-EQUIP_TOOL: {"type":"EQUIP_TOOL","toolName":"Tool/Silah adı"}
-USE_TOOL: {"type":"USE_TOOL","toolName":"Tool/Silah adı","duration":3,"cooldown":0.45}
-ATTACK_PLAYER: {"type":"ATTACK_PLAYER","targetName":"oyuncu adı","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
-ATTACK_AI: {"type":"ATTACK_AI","targetName":"GPT|Gemini|Grok və ya AI rig adı","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
-ATTACK: {"type":"ATTACK","targetName":"oyuncu və ya AI adı","targetType":"PLAYER|AI","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
 BUILD: {"type":"BUILD","name":"UserRequestedObject","description":"istifadəçinin bütün detalı","parts":[{"shape":"Block|Ball|Cylinder|Wedge","size":[4,1,4],"offset":[0,0,0],"material":"Plastic","color":[255,255,255],"anchored":true,"name":"Part"}]}
 TOOLBOX: {"type":"TOOLBOX","query":"specific decoration requested by user","count":1}
 WEAR: {"type":"WEAR","assetId":123}
@@ -668,36 +660,6 @@ function localCommand(message) {
     m.includes('creator store') ||
     m.includes('creatorstore');
 
-  const attackRegexBefore = /^(.+?)\s+(saldir|saldır|hucum et|hücum et|attack|atak et|vur)(?:\s+ona)?$/i;
-  const attackRegexAfter = /^(saldir|saldır|hucum et|hücum et|attack|atak et|vur)\s+(.+)$/i;
-  const rawMessage = String(message || '').trim();
-  const am = rawMessage.match(attackRegexBefore) || rawMessage.match(attackRegexAfter);
-  if (am) {
-    let target = (am[2] || am[1] || '').trim();
-    target = target.replace(/^(basqa ai|başqa ai|basqa player|başqa player|ai|oyuncu|player)\s+/i, '');
-    target = target.replace(/[\-–—]?(?:y)?[əe]$/i, '').trim();
-    if (target) {
-      const nt = normalizeTextForCommand(target);
-      const isAI = nt === 'gpt' || nt === 'gemini' || nt === 'grok';
-      result.reply = isAI ? 'Oldu, həmin AI-yə hücum edirəm.' : 'Oldu, həmin oyunçuya hücum edirəm.';
-      result.actions = [{ type: isAI ? 'ATTACK_AI' : 'ATTACK_PLAYER', targetName: target, duration: 8, damage: 10 }];
-      return result;
-    }
-  }
-
-  if ((m.includes('silah') || m.includes('weapon') || m.includes('equip tool') || m.includes('toolu gotur') || m.includes('toolu götür')) &&
-      (m.includes('gotur') || m.includes('götür') || m.includes('equip') || m.includes('al'))) {
-    result.reply = 'Oldu, Tool-u AI-yə verdim.';
-    result.actions = [{ type: 'EQUIP_TOOL', toolName: '' }];
-    return result;
-  }
-
-  if (m.includes('toolu islet') || m.includes('toolu işlət') || m.includes('silahla vur') || m.includes('silahla attack')) {
-    result.reply = 'Oldu, Tool-u işlədib hücum edirəm.';
-    result.actions = [{ type: 'USE_TOOL', duration: 3 }];
-    return result;
-  }
-
   if (wantsToolbox) {
     let query = String(message || '').trim();
 
@@ -799,9 +761,35 @@ function localCommand(message) {
     return result;
   }
 
+  const danceMatch = m.match(/(?:dance|dans|reqs|rəqs)\s*([1-7])$/);
+  if (danceMatch) {
+    const idx = Number(danceMatch[1]);
+    result.reply = `Rəqs ${idx} edirəm!`;
+    result.actions = [{ type: `DANCE_${idx}` }];
+    return result;
+  }
+
   if (hasAny('dans et', 'dance et', 'reqs et', 'rəqs et', 'dance', 'dans', 'reqs', 'rəqs')) {
     result.reply = 'Rəqs edirəm!';
     result.actions = [{ type: 'DANCE' }];
+    return result;
+  }
+
+  if (hasAny('masina min', 'maşına min', 'masina minsın', 'arabaya min', 'vehicle enter', 'car enter', 'masin enter')) {
+    result.reply = 'Maşına mindim.';
+    result.actions = [{ type: 'VEHICLE_ENTER' }];
+    return result;
+  }
+
+  if (hasAny('masindan dus', 'maşından düş', 'arabadan dus', 'vehicle exit', 'car exit')) {
+    result.reply = 'Maşından düşdüm.';
+    result.actions = [{ type: 'VEHICLE_EXIT' }];
+    return result;
+  }
+
+  if (hasAny('masin sur', 'masini sur', 'maşın sür', 'maşını sür', 'araba sur', 'arabayi sur', 'arabayı sür', 'vehicle drive', 'car drive')) {
+    result.reply = 'Maşını sürürəm.';
+    result.actions = [{ type: 'VEHICLE_DRIVE', duration: 12, throttle: 1, steer: 0, direction: 'forward' }];
     return result;
   }
 
