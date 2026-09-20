@@ -1,13 +1,10 @@
 'use strict';
 
-// Roblox OpenAI + Gemini + Grok AI Backend
+// Roblox OpenAI GPT + Gemini + Grok AI Backend
 // Node.js 18+
 // .env:
 // OPENAI_API_KEY=...
-// OPENAI_MODEL=gpt-5.2
 // GEMINI_API_KEY=...
-// ZENMUX_API_KEY=...
-// ZENMUX_GROK_MODEL=x-ai/grok-4.6
 // PORT=3000
 
 const http = require('http');
@@ -52,7 +49,7 @@ function loadDotEnv() {
 loadDotEnv();
 
 const PORT = Number(process.env.PORT || 3000);
-const OPENAI_MODEL = String(process.env.OPENAI_MODEL || 'gpt-5.2').trim();
+const OPENAI_MODEL = String(process.env.OPENAI_MODEL || 'gpt-5.6-luna').trim();
 const GEMINI_MODEL = String(process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite').trim();
 const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
@@ -886,14 +883,16 @@ async function callGPT({ ownerName, message, history, world, assets }) {
     actionMode,
   });
 
-  const messages = [
-    { role: 'developer', content: system },
+  const input = [
     ...history.slice(-MAX_HISTORY),
     { role: 'user', content: clampText(message) },
-  ];
+  ].map(item => ({
+    role: item.role === 'assistant' ? 'assistant' : 'user',
+    content: typeof item.content === 'string' ? item.content : JSON.stringify(item.content ?? ''),
+  }));
 
   const data = await fetchJson(
-    'https://api.openai.com/v1/chat/completions',
+    'https://api.openai.com/v1/responses',
     {
       method: 'POST',
       headers: {
@@ -902,21 +901,32 @@ async function callGPT({ ownerName, message, history, world, assets }) {
       },
       body: JSON.stringify({
         model: OPENAI_MODEL,
-        messages,
-        temperature: 0.7,
-        max_tokens: actionMode ? 14000 : 500,
+        instructions: system,
+        input,
+        max_output_tokens: actionMode ? 14000 : 700,
       }),
     },
     'OpenAI'
   );
 
-  const content = data?.choices?.[0]?.message?.content;
+  let content = data?.output_text;
+  if (typeof content !== 'string' || !content.trim()) {
+    const chunks = [];
+    for (const item of Array.isArray(data?.output) ? data.output : []) {
+      for (const part of Array.isArray(item?.content) ? item.content : []) {
+        if (typeof part?.text === 'string') chunks.push(part.text);
+      }
+    }
+    content = chunks.join('');
+  }
+
   if (typeof content !== 'string' || !content.trim()) {
     throw new Error('OpenAI boş cavab qaytardı.');
   }
 
   return normalizeModelOutput(content);
 }
+
 async function callGemini({ ownerName, message, history, world, assets }) {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY tapilmadi.');
 
@@ -1105,7 +1115,7 @@ async function processAI(provider, body) {
         ? 'Gemini API açarı qəbul edilmədi.'
         : provider === 'grok'
           ? 'ZenMux API açarı qəbul edilmədi.'
-          : 'OpenAI API açarı qəbul edilmədi.';
+          : 'OpenRouter API açarı qəbul edilmədi.';
     } else if (status === 400) {
       reply = 'AI sorğusunun formatında problem var.';
     }
@@ -1359,7 +1369,7 @@ async function generateStudioSource({ provider, prompt, ownerUserId, targetServi
 
   if (provider === 'gpt' && OPENAI_API_KEY) {
     const data = await fetchJson(
-      'https://api.openai.com/v1/chat/completions',
+      'https://api.openai.com/v1/responses',
       {
         method: 'POST',
         headers: {
@@ -1368,17 +1378,25 @@ async function generateStudioSource({ provider, prompt, ownerUserId, targetServi
         },
         body: JSON.stringify({
           model: OPENAI_MODEL,
-          messages: [
-            { role: 'developer', content: system },
-            { role: 'user', content: prompt },
-          ],
-          temperature: 0.12,
-          max_tokens: 5000,
+          instructions: system,
+          input: prompt,
+          max_output_tokens: 5000,
         }),
       },
       'OpenAI Studio'
     );
-    const raw = data?.choices?.[0]?.message?.content || '';
+
+    let raw = data?.output_text || '';
+    if (!raw) {
+      const chunks = [];
+      for (const item of Array.isArray(data?.output) ? data.output : []) {
+        for (const part of Array.isArray(item?.content) ? item.content : []) {
+          if (typeof part?.text === 'string') chunks.push(part.text);
+        }
+      }
+      raw = chunks.join('');
+    }
+
     return String(raw).replace(/^```(?:lua|luau)?\s*/i, '').replace(/\s*```$/i, '').trim();
   }
 
