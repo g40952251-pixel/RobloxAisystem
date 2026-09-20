@@ -60,10 +60,10 @@ const ZENMUX_API_KEY = String(process.env.ZENMUX_API_KEY || '').trim();
 const ZENMUX_GROK_MODEL = String(process.env.ZENMUX_GROK_MODEL || 'x-ai/grok-4.6').trim();
 const ROBLOX_TOOLBOX_API_KEY = String(process.env.ROBLOX_TOOLBOX_API_KEY || '').trim();
 
-const MAX_HISTORY = 12;
-const MAX_MESSAGE_CHARS = 5000;
-const REQUEST_TIMEOUT_MS = 15000;
-const MAX_RETRIES = 1;
+const MAX_HISTORY = 8;
+const MAX_MESSAGE_CHARS = 4000;
+const REQUEST_TIMEOUT_MS = 10000;
+const MAX_RETRIES = 0;
 const MAX_BODY_BYTES = 1024 * 1024;
 
 const brains = new Map();
@@ -402,7 +402,8 @@ FAST RULES:
 - Reply ən çox 80 simvol olsun.
 - İzah, markdown, kod bloku və əlavə mətn yazma.
 - Əmr aydındırsa birbaşa action qaytar.
-- Yalnız lazım olan 1-3 action qaytar.
+- Əmr icra olunmalıdır; yalnız cavab yazmaq kifayət deyil.
+- Sadə əmr üçün maksimum 1 action; ardıcıl əmrlər üçün maksimum 3 action qaytar.
 
 İcazəli action tipləri:
 STOP
@@ -881,7 +882,7 @@ async function callGrok({ ownerName, message, history, world, assets }) {
         model: ZENMUX_GROK_MODEL,
         messages,
         temperature: actionMode ? 0.15 : 0.65,
-        max_tokens: actionMode ? 2400 : 420,
+        max_tokens: actionMode ? 1400 : 240,
       }),
     },
     'ZenMux Grok'
@@ -928,7 +929,7 @@ async function callGPT({ ownerName, message, history, world, assets }) {
         model: OPENAI_MODEL,
         messages,
         temperature: actionMode ? 0.15 : 0.65,
-        max_tokens: actionMode ? 2400 : 420,
+        max_tokens: actionMode ? 1400 : 240,
       }),
     },
     'OpenAI'
@@ -989,7 +990,7 @@ async function callGemini({ ownerName, message, history, world, assets }) {
         contents,
         generationConfig: {
           temperature: actionMode ? 0.15 : 0.65,
-          maxOutputTokens: actionMode ? 2400 : 420,
+          maxOutputTokens: actionMode ? 1400 : 240,
         },
       }),
     },
@@ -1161,6 +1162,7 @@ function sendJson(res, status, payload) {
   const data = JSON.stringify(payload);
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Connection', 'keep-alive');
   res.setHeader('Content-Length', Buffer.byteLength(data));
   res.end(data);
 }
