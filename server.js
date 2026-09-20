@@ -1,10 +1,13 @@
 'use strict';
 
-// Roblox OpenAI GPT + Gemini + Grok AI Backend
+// Roblox OpenAI + Gemini + Grok AI Backend
 // Node.js 18+
 // .env:
 // OPENAI_API_KEY=...
+// OPENAI_MODEL=gpt-5.2
 // GEMINI_API_KEY=...
+// ZENMUX_API_KEY=...
+// ZENMUX_GROK_MODEL=x-ai/grok-4.6
 // PORT=3000
 
 const http = require('http');
@@ -49,7 +52,7 @@ function loadDotEnv() {
 loadDotEnv();
 
 const PORT = Number(process.env.PORT || 3000);
-const OPENAI_MODEL = String(process.env.OPENAI_MODEL || 'gpt-5.6-luna').trim();
+const OPENAI_MODEL = String(process.env.OPENAI_MODEL || 'gpt-5.2').trim();
 const GEMINI_MODEL = String(process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite').trim();
 const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
@@ -146,6 +149,7 @@ function isActionMessage(message) {
     'izle', 'izlə', 'follow', 'tp', 'teleport', 'tullan', 'jump', 'dance',
     'reqs', 'rəqs', 'toolbox', 'model', 'masin', 'maşın', 'vehicle', 'car',
     'gey', 'geyin', 'wear', 'paltar', 'sil', 'remove', 'clear', 'edit',
+    'saldir', 'saldır', 'hucum', 'hücum', 'attack', 'atak', 'vur', 'silah', 'weapon', 'equip tool',
     'duzelt', 'düzəlt', 'outfit', 'script', 'server script', 'starterplayer', 'starterplayerscripts', 'localscript', 'local script', 'luau', 'kod yaz', 'script yaz', 'script sil', 'scripti sil', 'sil script', 'saga don', 'sağa dön', 'sola don',
     'sola dön', 'duz get', 'düz get', 'suret', 'sürət', 'takip', 'teqib', 'qucaq', 'hug', 'carry', 'dasima', 'qaldir', 'dans etdir', 'dance etdir', 'birlikde', 'birlikdə', 'dansimizi', 'danimizi', 'dans dayandir', 'dansi durdur', 'dansimizi durdur'
   ];
@@ -387,6 +391,9 @@ function buildSystemPrompt({ provider, ownerName, world, assets, actionMode }) {
     '- Bir hərəkəti yerinə yetirmək üçün uyğun action qaytar.',
     '- Normal hərəkət teleport deyil; Roblox tərəfi WALK_TO, JUMP, FOLLOW və VEHICLE_DRIVE kimi fiziki icra etməlidir.',
     '- Dünya məlumatında maneə, player, model, maşın və digər obyektlər varsa, qərarında onlardan istifadə et.',
+    '- Açıq hücum əmri gəlirsə targetName və uyğun ATTACK action qaytar; yalnız mətnlə cavab vermə.',
+    '- ATTACK_PLAYER başqa oyunçunu, ATTACK_AI isə başqa AI rig-i hədəfləyir.',
+    '- Konkret Tool/silah adı verilirsə toolName sahəsini həmin adla doldur.',
   ].join('\n');
 
   let context = '';
@@ -437,6 +444,11 @@ CLEAR_OUTFIT
 VEHICLE_ENTER
 VEHICLE_EXIT
 VEHICLE_DRIVE
+EQUIP_TOOL
+USE_TOOL
+ATTACK_PLAYER
+ATTACK_AI
+ATTACK
 STUDIO_SCRIPT_CREATE
 STUDIO_SCRIPT_DELETE
 
@@ -471,6 +483,11 @@ TURN: {"type":"TURN","direction":"LEFT|RIGHT","degrees":90}
 VEHICLE_ENTER: {"type":"VEHICLE_ENTER"}
 VEHICLE_EXIT: {"type":"VEHICLE_EXIT"}
 VEHICLE_DRIVE: {"type":"VEHICLE_DRIVE","target":"player adı və ya destination","follow":true}
+EQUIP_TOOL: {"type":"EQUIP_TOOL","toolName":"Tool/Silah adı"}
+USE_TOOL: {"type":"USE_TOOL","toolName":"Tool/Silah adı","duration":3,"cooldown":0.45}
+ATTACK_PLAYER: {"type":"ATTACK_PLAYER","targetName":"oyuncu adı","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
+ATTACK_AI: {"type":"ATTACK_AI","targetName":"GPT|Gemini|Grok və ya AI rig adı","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
+ATTACK: {"type":"ATTACK","targetName":"oyuncu və ya AI adı","targetType":"PLAYER|AI","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
 BUILD: {"type":"BUILD","name":"UserRequestedObject","description":"istifadəçinin bütün detalı","parts":[{"shape":"Block|Ball|Cylinder|Wedge","size":[4,1,4],"offset":[0,0,0],"material":"Plastic","color":[255,255,255],"anchored":true,"name":"Part"}]}
 TOOLBOX: {"type":"TOOLBOX","query":"specific decoration requested by user","count":1}
 WEAR: {"type":"WEAR","assetId":123}
@@ -484,6 +501,7 @@ UNIVERSAL BUILD QAYDASI:
 - İstifadəçinin ölçü, mərtəbə, otaq, qapı, pəncərə, mebel, mühərrik, təkər, oturacaq, rels, dam, dekorasiya və digər detallarını nəzərə al.
 - Ev istənirsə yalnız çöl divarları yox, istifadəçi içini istəyirsə daxili də yarat.
 - Maşın istənirsə kuzovla yanaşı təkər, oturacaq, sükan, şüşə, işıq və istifadəçinin istədiyi əlavə hissələri qur.
+- Hazır maşın varsa VEHICLE_ENTER və VEHICLE_DRIVE action-ları ilə onu idarə edə bilərsən.
 - Qatar istənirsə lokomotiv, vaqonlar, təkərlər və lazım olan detallar qur.
 - Heç vaxt sorğuya uyğun olmayan hazır tipə keçmə; "spaceship" deyilirsə spaceship, "robot" deyilirsə robot, "shop" deyilirsə shop və s.
 - BUILD action-da hissələri bir-bir Part kimi göstər. Model hazır asset kimi istifadə olunmamalıdır.
@@ -649,6 +667,36 @@ function localCommand(message) {
     m.includes('toolbox') ||
     m.includes('creator store') ||
     m.includes('creatorstore');
+
+  const attackRegexBefore = /^(.+?)\s+(saldir|saldır|hucum et|hücum et|attack|atak et|vur)(?:\s+ona)?$/i;
+  const attackRegexAfter = /^(saldir|saldır|hucum et|hücum et|attack|atak et|vur)\s+(.+)$/i;
+  const rawMessage = String(message || '').trim();
+  const am = rawMessage.match(attackRegexBefore) || rawMessage.match(attackRegexAfter);
+  if (am) {
+    let target = (am[2] || am[1] || '').trim();
+    target = target.replace(/^(basqa ai|başqa ai|basqa player|başqa player|ai|oyuncu|player)\s+/i, '');
+    target = target.replace(/[\-–—]?(?:y)?[əe]$/i, '').trim();
+    if (target) {
+      const nt = normalizeTextForCommand(target);
+      const isAI = nt === 'gpt' || nt === 'gemini' || nt === 'grok';
+      result.reply = isAI ? 'Oldu, həmin AI-yə hücum edirəm.' : 'Oldu, həmin oyunçuya hücum edirəm.';
+      result.actions = [{ type: isAI ? 'ATTACK_AI' : 'ATTACK_PLAYER', targetName: target, duration: 8, damage: 10 }];
+      return result;
+    }
+  }
+
+  if ((m.includes('silah') || m.includes('weapon') || m.includes('equip tool') || m.includes('toolu gotur') || m.includes('toolu götür')) &&
+      (m.includes('gotur') || m.includes('götür') || m.includes('equip') || m.includes('al'))) {
+    result.reply = 'Oldu, Tool-u AI-yə verdim.';
+    result.actions = [{ type: 'EQUIP_TOOL', toolName: '' }];
+    return result;
+  }
+
+  if (m.includes('toolu islet') || m.includes('toolu işlət') || m.includes('silahla vur') || m.includes('silahla attack')) {
+    result.reply = 'Oldu, Tool-u işlədib hücum edirəm.';
+    result.actions = [{ type: 'USE_TOOL', duration: 3 }];
+    return result;
+  }
 
   if (wantsToolbox) {
     let query = String(message || '').trim();
@@ -883,16 +931,14 @@ async function callGPT({ ownerName, message, history, world, assets }) {
     actionMode,
   });
 
-  const input = [
+  const messages = [
+    { role: 'developer', content: system },
     ...history.slice(-MAX_HISTORY),
     { role: 'user', content: clampText(message) },
-  ].map(item => ({
-    role: item.role === 'assistant' ? 'assistant' : 'user',
-    content: typeof item.content === 'string' ? item.content : JSON.stringify(item.content ?? ''),
-  }));
+  ];
 
   const data = await fetchJson(
-    'https://api.openai.com/v1/responses',
+    'https://api.openai.com/v1/chat/completions',
     {
       method: 'POST',
       headers: {
@@ -901,32 +947,21 @@ async function callGPT({ ownerName, message, history, world, assets }) {
       },
       body: JSON.stringify({
         model: OPENAI_MODEL,
-        instructions: system,
-        input,
-        max_output_tokens: actionMode ? 14000 : 700,
+        messages,
+        temperature: 0.7,
+        max_tokens: actionMode ? 14000 : 500,
       }),
     },
     'OpenAI'
   );
 
-  let content = data?.output_text;
-  if (typeof content !== 'string' || !content.trim()) {
-    const chunks = [];
-    for (const item of Array.isArray(data?.output) ? data.output : []) {
-      for (const part of Array.isArray(item?.content) ? item.content : []) {
-        if (typeof part?.text === 'string') chunks.push(part.text);
-      }
-    }
-    content = chunks.join('');
-  }
-
+  const content = data?.choices?.[0]?.message?.content;
   if (typeof content !== 'string' || !content.trim()) {
     throw new Error('OpenAI boş cavab qaytardı.');
   }
 
   return normalizeModelOutput(content);
 }
-
 async function callGemini({ ownerName, message, history, world, assets }) {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY tapilmadi.');
 
@@ -1115,7 +1150,7 @@ async function processAI(provider, body) {
         ? 'Gemini API açarı qəbul edilmədi.'
         : provider === 'grok'
           ? 'ZenMux API açarı qəbul edilmədi.'
-          : 'OpenRouter API açarı qəbul edilmədi.';
+          : 'OpenAI API açarı qəbul edilmədi.';
     } else if (status === 400) {
       reply = 'AI sorğusunun formatında problem var.';
     }
@@ -1369,7 +1404,7 @@ async function generateStudioSource({ provider, prompt, ownerUserId, targetServi
 
   if (provider === 'gpt' && OPENAI_API_KEY) {
     const data = await fetchJson(
-      'https://api.openai.com/v1/responses',
+      'https://api.openai.com/v1/chat/completions',
       {
         method: 'POST',
         headers: {
@@ -1378,25 +1413,17 @@ async function generateStudioSource({ provider, prompt, ownerUserId, targetServi
         },
         body: JSON.stringify({
           model: OPENAI_MODEL,
-          instructions: system,
-          input: prompt,
-          max_output_tokens: 5000,
+          messages: [
+            { role: 'developer', content: system },
+            { role: 'user', content: prompt },
+          ],
+          temperature: 0.12,
+          max_tokens: 5000,
         }),
       },
       'OpenAI Studio'
     );
-
-    let raw = data?.output_text || '';
-    if (!raw) {
-      const chunks = [];
-      for (const item of Array.isArray(data?.output) ? data.output : []) {
-        for (const part of Array.isArray(item?.content) ? item.content : []) {
-          if (typeof part?.text === 'string') chunks.push(part.text);
-        }
-      }
-      raw = chunks.join('');
-    }
-
+    const raw = data?.choices?.[0]?.message?.content || '';
     return String(raw).replace(/^```(?:lua|luau)?\s*/i, '').replace(/\s*```$/i, '').trim();
   }
 
