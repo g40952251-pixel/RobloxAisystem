@@ -3,8 +3,11 @@
 // Roblox OpenAI + Gemini + Grok AI Backend
 // Node.js 18+
 // .env:
-// OPENAI_API_KEY=...
-// OPENAI_MODEL=gpt-5.2
+// KIE_API_KEY=...
+// KIE_GPT_MODEL=gpt-5-6-sol
+// KIE_GPT_REASONING=medium
+// OPENAI_API_KEY=... (legacy fallback)
+// OPENAI_MODEL=gpt-5.2 (legacy)
 // GEMINI_API_KEY=...
 // ZENMUX_API_KEY=...
 // ZENMUX_GROK_MODEL=x-ai/grok-4.6
@@ -53,6 +56,9 @@ loadDotEnv();
 
 const PORT = Number(process.env.PORT || 3000);
 const OPENAI_MODEL = String(process.env.OPENAI_MODEL || 'gpt-5.2').trim();
+const KIE_GPT_API_KEY = String(process.env.KIE_API_KEY || process.env.OPENAI_API_KEY || '').trim();
+const KIE_GPT_MODEL = String(process.env.KIE_GPT_MODEL || 'gpt-5-6-sol').trim();
+const KIE_GPT_REASONING = String(process.env.KIE_GPT_REASONING || 'medium').trim();
 const GEMINI_MODEL = String(process.env.GEMINI_MODEL || 'gemini-3.1-flash-lite').trim();
 const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
@@ -491,6 +497,7 @@ TURN: {"type":"TURN","direction":"LEFT|RIGHT","degrees":90}
 VEHICLE_ENTER: {"type":"VEHICLE_ENTER"}
 VEHICLE_EXIT: {"type":"VEHICLE_EXIT"}
 VEHICLE_DRIVE: {"type":"VEHICLE_DRIVE","target":"player adı və ya destination","follow":true}
+TOOLBOX: {"type":"TOOLBOX","assetId":123,"templateName":"ServerStorage-da əvvəlcədən Studio-da yerləşdirilmiş Model adı"}
 EQUIP_TOOL: {"type":"EQUIP_TOOL","toolName":"Tool/Silah adı"}
 USE_TOOL: {"type":"USE_TOOL","toolName":"Tool/Silah adı","duration":3,"cooldown":0.45}
 ATTACK_PLAYER: {"type":"ATTACK_PLAYER","targetName":"oyuncu adı","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
@@ -514,6 +521,7 @@ UNIVERSAL BUILD QAYDASI:
 - Heç vaxt sorğuya uyğun olmayan hazır tipə keçmə; "spaceship" deyilirsə spaceship, "robot" deyilirsə robot, "shop" deyilirsə shop və s.
 - BUILD action-da hissələri bir-bir Part kimi göstər. Model hazır asset kimi istifadə olunmamalıdır.
 - İstifadəçi dekorasiya üçün Toolbox istəyirsə BUILD-dən sonra bir və ya bir neçə TOOLBOX action qaytara bilərsən.
+- Exact Studio davranışı üçün istifadəçi templateName verirsə assetId əvəzinə templateName qaytar; həmin Model ServerStorage-da olmalıdır.
 - İstifadəçi ayrıca Toolbox istəməyibsə, tikintinin əsas gövdəsini BUILD parts ilə et.
 - BUILD üçün istifadəçinin dediyi bütün detalları bir action-da mümkün qədər çox Part ilə təmsil et; limit 500 Part.
 - Sayğac yalnız həqiqətən action.parts içində göndərilən və Roblox-da yaradılan Part sayına uyğun olacaq; saxta 0/10 və ya sabit 10 yazma.
@@ -989,7 +997,7 @@ async function callGrok({ ownerName, message, history, world, assets }) {
 }
 
 async function callGPT({ ownerName, message, history, world, assets }) {
-  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY tapilmadi.');
+  if (!KIE_GPT_API_KEY) throw new Error('KIE_API_KEY / OPENAI_API_KEY tapilmadi.');
 
   const actionMode = isActionMessage(message);
   const system = buildSystemPrompt({
@@ -1000,35 +1008,52 @@ async function callGPT({ ownerName, message, history, world, assets }) {
     actionMode,
   });
 
-  const messages = [
-    { role: 'developer', content: system },
-    ...history.slice(-MAX_HISTORY),
-    { role: 'user', content: clampText(message) },
+  const input = [
+    {
+      role: 'developer',
+      content: [{ type: 'input_text', text: system }],
+    },
+    ...history.slice(-MAX_HISTORY).map(item => ({
+      role: item.role,
+      content: [{ type: 'input_text', text: clampText(String(item.content || ''), 3500) }],
+    })),
+    {
+      role: 'user',
+      content: [{ type: 'input_text', text: clampText(message) }],
+    },
   ];
 
   const data = await fetchJson(
-    'https://api.openai.com/v1/chat/completions',
+    'https://api.kie.ai/codex/v1/responses',
     {
       method: 'POST',
       headers: {
-        'Authorization': 'Bearer ' + OPENAI_API_KEY,
+        'Authorization': 'Bearer ' + KIE_GPT_API_KEY,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: OPENAI_MODEL,
-        messages,
-        temperature: 0.7,
-        max_tokens: actionMode ? 5000 : 500,
+        model: KIE_GPT_MODEL,
+        stream: false,
+        input,
+        reasoning: { effort: KIE_GPT_REASONING },
       }),
     },
-    'OpenAI'
+    'KIE GPT-5.6 Sol'
   );
 
-  const content = data?.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || !content.trim()) {
-    throw new Error('OpenAI boş cavab qaytardı.');
+  let content = typeof data?.output_text === 'string' ? data.output_text : '';
+
+  if (!content && Array.isArray(data?.output)) {
+    for (const item of data.output) {
+      if (item?.type !== 'message' || !Array.isArray(item.content)) continue;
+      content += item.content
+        .map(part => part?.type === 'output_text' ? safeString(part.text) : '')
+        .filter(Boolean)
+        .join('');
+    }
   }
 
+  if (!content.trim()) throw new Error('KIE GPT-5.6 Sol boş cavab qaytardı.');
   return normalizeModelOutput(content);
 }
 async function callGemini({ ownerName, message, history, world, assets }) {
@@ -1471,28 +1496,38 @@ async function generateStudioSource({ provider, prompt, ownerUserId, targetServi
     return raw.replace(/^```(?:lua|luau)?\s*/i, '').replace(/\s*```$/i, '').trim();
   }
 
-  if (provider === 'gpt' && OPENAI_API_KEY) {
+  if (provider === 'gpt' && KIE_GPT_API_KEY) {
     const data = await fetchJson(
-      'https://api.openai.com/v1/chat/completions',
+      'https://api.kie.ai/codex/v1/responses',
       {
         method: 'POST',
         headers: {
-          Authorization: 'Bearer ' + OPENAI_API_KEY,
+          Authorization: 'Bearer ' + KIE_GPT_API_KEY,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: OPENAI_MODEL,
-          messages: [
-            { role: 'developer', content: system },
-            { role: 'user', content: prompt },
+          model: KIE_GPT_MODEL,
+          stream: false,
+          input: [
+            { role: 'developer', content: [{ type: 'input_text', text: system }] },
+            { role: 'user', content: [{ type: 'input_text', text: prompt }] },
           ],
-          temperature: 0.12,
-          max_tokens: 5000,
+          reasoning: { effort: KIE_GPT_REASONING },
         }),
       },
-      'OpenAI Studio'
+      'KIE GPT-5.6 Sol Studio'
     );
-    const raw = data?.choices?.[0]?.message?.content || '';
+
+    let raw = typeof data?.output_text === 'string' ? data.output_text : '';
+    if (!raw && Array.isArray(data?.output)) {
+      for (const item of data.output) {
+        if (item?.type !== 'message' || !Array.isArray(item.content)) continue;
+        raw += item.content
+          .map(part => part?.type === 'output_text' ? safeString(part.text) : '')
+          .filter(Boolean)
+          .join('');
+      }
+    }
     return String(raw).replace(/^```(?:lua|luau)?\s*/i, '').replace(/\s*```$/i, '').trim();
   }
 
@@ -1689,12 +1724,13 @@ const server = http.createServer(async (req, res) => {
       message: 'Roblox AI backend işləyir.',
       port: PORT,
       models: {
-        gpt: OPENAI_MODEL,
+        gpt: KIE_GPT_MODEL,
         gemini: GEMINI_MODEL,
         grok: ZENMUX_GROK_MODEL,
       },
       keys: {
-        openai: Boolean(OPENAI_API_KEY),
+        kie: Boolean(KIE_GPT_API_KEY),
+        openaiLegacy: Boolean(OPENAI_API_KEY),
         gemini: Boolean(GEMINI_API_KEY),
         grok: Boolean(ZENMUX_API_KEY),
         robloxToolbox: Boolean(ROBLOX_TOOLBOX_API_KEY),
@@ -1836,10 +1872,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(' GPT endpoint:    http://127.0.0.1:' + PORT + '/gpt');
   console.log(' Gemini endpoint: http://127.0.0.1:' + PORT + '/gemini');
   console.log(' Grok endpoint:   http://127.0.0.1:' + PORT + '/grok');
-  console.log(' OpenAI model:     ' + OPENAI_MODEL);
+  console.log(' GPT KIE model:     ' + KIE_GPT_MODEL);
   console.log(' Gemini model:    ' + GEMINI_MODEL);
   console.log(' Grok model:      ' + ZENMUX_GROK_MODEL);
-  console.log(' OpenAI key:       ' + (OPENAI_API_KEY ? 'OK' : 'YOOX'));
+  console.log(' KIE GPT key:       ' + (KIE_GPT_API_KEY ? 'OK' : 'YOOX'));
   console.log(' Gemini key:      ' + (GEMINI_API_KEY ? 'OK' : 'YOOX'));
   console.log(' ZenMux Grok key: ' + (ZENMUX_API_KEY ? 'OK' : 'YOOX'));
   console.log('==============================================');
