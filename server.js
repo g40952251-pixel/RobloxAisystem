@@ -1,6 +1,6 @@
 'use strict';
 
-// Roblox OpenAI + Gemini + Grok AI Backend
+// Roblox KIE GPT-5.6 Sol + Gemini + Grok + DeepSeek AI Backend
 // Node.js 18+
 // .env:
 // KIE_API_KEY=...
@@ -11,6 +11,9 @@
 // GEMINI_API_KEY=...
 // ZENMUX_API_KEY=...
 // ZENMUX_GROK_MODEL=x-ai/grok-4.6
+// DEEPSEEK_API_KEY=...
+// DEEPSEEK_MODEL=deepseek-flash
+// DEEPSEEK_THINKING=disabled
 // PORT=3000
 
 const http = require('http');
@@ -64,6 +67,10 @@ const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || '').trim();
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
 const ZENMUX_API_KEY = String(process.env.ZENMUX_API_KEY || '').trim();
 const ZENMUX_GROK_MODEL = String(process.env.ZENMUX_GROK_MODEL || 'x-ai/grok-4.6').trim();
+const DEEPSEEK_API_KEY = String(process.env.DEEPSEEK_API_KEY || '').trim();
+const DEEPSEEK_MODEL = String(process.env.DEEPSEEK_MODEL || 'deepseek-flash').trim();
+const DEEPSEEK_THINKING = String(process.env.DEEPSEEK_THINKING || 'disabled').trim();
+const DEEPSEEK_REASONING_EFFORT = String(process.env.DEEPSEEK_REASONING_EFFORT || 'high').trim();
 const ROBLOX_TOOLBOX_API_KEY = String(process.env.ROBLOX_TOOLBOX_API_KEY || '').trim();
 
 const MAX_HISTORY = 12;
@@ -80,16 +87,19 @@ const providerQueues = {
   gpt: Promise.resolve(),
   gemini: Promise.resolve(),
   grok: Promise.resolve(),
+  deepseek: Promise.resolve(),
 };
 const lastProviderRequestAt = {
   gpt: 0,
   gemini: 0,
   grok: 0,
+  deepseek: 0,
 };
 const MIN_GAP_MS = {
   gpt: 250,
   gemini: 1200,
   grok: 300,
+  deepseek: 250,
 };
 
 function sleep(ms) {
@@ -125,6 +135,15 @@ function normalizeProvider(value) {
     return 'grok';
   }
 
+  if (
+    compact === 'deep' ||
+    compact.includes('deepseek') ||
+    compact.includes('deepsek') ||
+    compact === 'deeps'
+  ) {
+    return 'deepseek';
+  }
+
   return 'gpt';
 }
 
@@ -155,7 +174,6 @@ function isActionMessage(message) {
     'izle', 'izlə', 'follow', 'tp', 'teleport', 'tullan', 'jump', 'dance',
     'reqs', 'rəqs', 'toolbox', 'model', 'masin', 'maşın', 'vehicle', 'car',
     'gey', 'geyin', 'wear', 'paltar', 'sil', 'remove', 'clear', 'edit',
-    'saldir', 'saldır', 'hucum', 'hücum', 'attack', 'atak', 'vur', 'silah', 'weapon', 'equip tool',
     'duzelt', 'düzəlt', 'outfit', 'script', 'server script', 'starterplayer', 'starterplayerscripts', 'localscript', 'local script', 'luau', 'kod yaz', 'script yaz', 'script sil', 'scripti sil', 'sil script', 'saga don', 'sağa dön', 'sola don',
     'sola dön', 'duz get', 'düz get', 'suret', 'sürət', 'takip', 'teqib', 'qucaq', 'hug', 'carry', 'dasima', 'qaldir', 'dans etdir', 'dance etdir', 'birlikde', 'birlikdə', 'dansimizi', 'danimizi', 'dans dayandir', 'dansi durdur', 'dansimizi durdur'
   ];
@@ -380,7 +398,7 @@ async function fetchJson(url, options, label) {
 }
 
 function buildSystemPrompt({ provider, ownerName, world, assets, actionMode }) {
-  const aiName = provider === 'gemini' ? 'Gemini' : provider === 'grok' ? 'Grok' : 'GPT';
+  const aiName = provider === 'gemini' ? 'Gemini' : provider === 'grok' ? 'Grok' : provider === 'deepseek' ? 'Deep' : 'GPT';
 
   const base = [
     'Sən Roblox oyununda yaşayan müstəqil AI NPC-sən.',
@@ -392,14 +410,11 @@ function buildSystemPrompt({ provider, ownerName, world, assets, actionMode }) {
     '- Təbii, qısa və konkret danış.',
     '- Cavaba User:, Sage:, GPT:, Gemini: və ya [GPT]/[Gemini] kimi ad etiketi əlavə etmə.',
     '- Roblox dünyasını nəzərə al.',
-    '- GPT və Gemini ayrı AI-lardır; yaddaşlarını qarışdırma.',
+    '- GPT, Gemini, Grok və Deep ayrı AI-lardır; yaddaşlarını qarışdırma.',
     '- Başqa AI-ların mövcudluğunu dünya məlumatından görə bilərsən.',
     '- Bir hərəkəti yerinə yetirmək üçün uyğun action qaytar.',
     '- Normal hərəkət teleport deyil; Roblox tərəfi WALK_TO, JUMP, FOLLOW və VEHICLE_DRIVE kimi fiziki icra etməlidir.',
     '- Dünya məlumatında maneə, player, model, maşın və digər obyektlər varsa, qərarında onlardan istifadə et.',
-    '- Açıq hücum əmri gəlirsə targetName və uyğun ATTACK action qaytar; yalnız mətnlə cavab vermə.',
-    '- ATTACK_PLAYER başqa oyunçunu, ATTACK_AI isə başqa AI rig-i hədəfləyir.',
-    '- Konkret Tool/silah adı verilirsə toolName sahəsini həmin adla doldur.',
   ].join('\n');
 
   let context = '';
@@ -458,11 +473,6 @@ VEHICLE_ENTER
 VEHICLE_EXIT
 VEHICLE_DRIVE
 VEHICLE_STOP
-EQUIP_TOOL
-USE_TOOL
-ATTACK_PLAYER
-ATTACK_AI
-ATTACK
 STUDIO_SCRIPT_CREATE
 STUDIO_SCRIPT_DELETE
 
@@ -498,11 +508,6 @@ VEHICLE_ENTER: {"type":"VEHICLE_ENTER"}
 VEHICLE_EXIT: {"type":"VEHICLE_EXIT"}
 VEHICLE_DRIVE: {"type":"VEHICLE_DRIVE","target":"player adı və ya destination","follow":true}
 TOOLBOX: {"type":"TOOLBOX","assetId":123,"templateName":"ServerStorage-da əvvəlcədən Studio-da yerləşdirilmiş Model adı"}
-EQUIP_TOOL: {"type":"EQUIP_TOOL","toolName":"Tool/Silah adı"}
-USE_TOOL: {"type":"USE_TOOL","toolName":"Tool/Silah adı","duration":3,"cooldown":0.45}
-ATTACK_PLAYER: {"type":"ATTACK_PLAYER","targetName":"oyuncu adı","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
-ATTACK_AI: {"type":"ATTACK_AI","targetName":"GPT|Gemini|Grok və ya AI rig adı","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
-ATTACK: {"type":"ATTACK","targetName":"oyuncu və ya AI adı","targetType":"PLAYER|AI","toolName":"Sword|Gun|Weapon","duration":8,"damage":10,"range":8}
 BUILD: {"type":"BUILD","name":"UserRequestedObject","description":"istifadəçinin bütün detalı","parts":[{"shape":"Block|Ball|Cylinder|Wedge","size":[4,1,4],"offset":[0,0,0],"material":"Plastic","color":[255,255,255],"anchored":true,"name":"Part"}]}
 TOOLBOX: {"type":"TOOLBOX","query":"specific decoration requested by user","count":1}
 WEAR: {"type":"WEAR","assetId":123}
@@ -684,36 +689,6 @@ function localCommand(message) {
     m.includes('creator store') ||
     m.includes('creatorstore');
 
-  const attackRegexBefore = /^(.+?)\s+(saldir|saldır|hucum et|hücum et|attack|atak et|vur)(?:\s+ona)?$/i;
-  const attackRegexAfter = /^(saldir|saldır|hucum et|hücum et|attack|atak et|vur)\s+(.+)$/i;
-  const rawMessage = String(message || '').trim();
-  const am = rawMessage.match(attackRegexBefore) || rawMessage.match(attackRegexAfter);
-  if (am) {
-    let target = (am[2] || am[1] || '').trim();
-    target = target.replace(/^(basqa ai|başqa ai|basqa player|başqa player|ai|oyuncu|player)\s+/i, '');
-    target = target.replace(/[\-–—]?(?:y)?[əe]$/i, '').trim();
-    if (target) {
-      const nt = normalizeTextForCommand(target);
-      const isAI = nt === 'gpt' || nt === 'gemini' || nt === 'grok';
-      result.reply = isAI ? 'Oldu, həmin AI-yə hücum edirəm.' : 'Oldu, həmin oyunçuya hücum edirəm.';
-      result.actions = [{ type: isAI ? 'ATTACK_AI' : 'ATTACK_PLAYER', targetName: target, duration: 8, damage: 10 }];
-      return result;
-    }
-  }
-
-  if ((m.includes('silah') || m.includes('weapon') || m.includes('equip tool') || m.includes('toolu gotur') || m.includes('toolu götür')) &&
-      (m.includes('gotur') || m.includes('götür') || m.includes('equip') || m.includes('al'))) {
-    result.reply = 'Oldu, Tool-u AI-yə verdim.';
-    result.actions = [{ type: 'EQUIP_TOOL', toolName: '' }];
-    return result;
-  }
-
-  if (m.includes('toolu islet') || m.includes('toolu işlət') || m.includes('silahla vur') || m.includes('silahla attack')) {
-    result.reply = 'Oldu, Tool-u işlədib hücum edirəm.';
-    result.actions = [{ type: 'USE_TOOL', duration: 3 }];
-    return result;
-  }
-
   if (wantsToolbox) {
     let query = String(message || '').trim();
 
@@ -809,36 +784,6 @@ function localCommand(message) {
     return result;
   }
 
-  // Explicit combat command: execute immediately, without waiting for model reasoning.
-  const attackPatterns = [
-    /(.+?)\s+(?:saldir|saldır|hucum et|hücum et|attack|vur|atak et)$/i,
-    /(?:saldir|saldır|hucum et|hücum et|attack|vur|atak et)\s+(.+)$/i
-  ];
-  for (const pattern of attackPatterns) {
-    const mm = String(message || '').trim().match(pattern);
-    if (!mm) continue;
-
-    let targetName = String(mm[1] || '').trim()
-      .replace(/^(basqa ai|başqa ai|ai|oyuncu|player)\s+/i, '')
-      .trim();
-
-    if (!targetName) continue;
-
-    const nt = normalizeTextForCommand(targetName);
-    const isAI = ['gpt','gemini','grok'].includes(nt) ||
-      m.includes('basqa ai') || m.includes('bashqa ai') || m.includes('başqa ai');
-
-    result.reply = isAI ? 'Oldu, həmin AI-yə hücum edirəm.' : 'Oldu, həmin oyunçuya hücum edirəm.';
-    result.actions = [{
-      type: isAI ? 'ATTACK_AI' : 'ATTACK_PLAYER',
-      targetName,
-      duration: 10,
-      damage: 10,
-      range: 8
-    }];
-    return result;
-  }
-
   const danceMatch = m.match(/\b(?:dance|dans|reqs|rəqs)\s*([1-7])\b/i);
   if (danceMatch) {
     const n = Math.max(1, Math.min(7, Number(danceMatch[1]) || 1));
@@ -856,12 +801,6 @@ function localCommand(message) {
   if (hasAny('dans et', 'dance et', 'reqs et', 'rəqs et', 'dance', 'dans', 'reqs', 'rəqs')) {
     result.reply = 'Rəqs edirəm!';
     result.actions = [{ type: 'DANCE' }];
-    return result;
-  }
-
-  if (hasAny('silahi gotur','silahi götür','silah gotur','silah götür','toolu gotur','toolu götür','equip tool','silah al')) {
-    result.reply = 'Silahı götürürəm.';
-    result.actions = [{ type: 'EQUIP_TOOL', toolName: '' }];
     return result;
   }
 
@@ -996,6 +935,155 @@ async function callGrok({ ownerName, message, history, world, assets }) {
   return normalizeModelOutput(content);
 }
 
+function parseKieResponsePayload(data) {
+  if (data && typeof data === 'object' && !data.raw) return data;
+  const raw = data && typeof data.raw === 'string' ? data.raw : '';
+  if (!raw.trim()) return data || null;
+
+  // KIE documents this endpoint with text/event-stream. Even when stream:false
+  // is sent, some responses can still arrive as SSE frames.
+  const events = raw
+    .split(/\r?\n\r?\n/)
+    .map(block => {
+      const lines = block.split(/\r?\n/);
+      const dataLines = lines
+        .filter(line => line.startsWith('data:'))
+        .map(line => line.slice(5).trimStart());
+      return dataLines.join('\n');
+    })
+    .filter(Boolean);
+
+  if (!events.length) {
+    try { return JSON.parse(raw); } catch { return { raw }; }
+  }
+
+  const parsed = [];
+  for (const item of events) {
+    if (item === '[DONE]') continue;
+    try { parsed.push(JSON.parse(item)); } catch {}
+  }
+
+  if (!parsed.length) return { raw };
+
+  // If one frame is the complete Responses object, use it directly.
+  for (const item of parsed) {
+    if (Array.isArray(item?.output) || typeof item?.output_text === 'string') {
+      return item;
+    }
+  }
+
+  // Otherwise accumulate text deltas from Responses-style SSE events.
+  let text = '';
+  let latest = parsed[parsed.length - 1];
+  for (const item of parsed) {
+    const delta =
+      item?.delta ??
+      item?.text ??
+      item?.content?.[0]?.text ??
+      item?.item?.content?.[0]?.text ??
+      '';
+    if (typeof delta === 'string') text += delta;
+    else if (Array.isArray(item?.content)) {
+      for (const part of item.content) {
+        if (typeof part?.text === 'string') text += part.text;
+      }
+    }
+  }
+
+  if (text.trim()) {
+    return { output_text: text, ...latest };
+  }
+
+  return latest;
+}
+
+function extractKieText(data) {
+  const payload = parseKieResponsePayload(data);
+
+  if (typeof payload?.output_text === 'string' && payload.output_text.trim()) {
+    return payload.output_text;
+  }
+
+  if (Array.isArray(payload?.output)) {
+    let text = '';
+    for (const item of payload.output) {
+      if (item?.type !== 'message' || !Array.isArray(item.content)) continue;
+      for (const part of item.content) {
+        if (part?.type === 'output_text' && typeof part.text === 'string') {
+          text += part.text;
+        }
+      }
+    }
+    if (text.trim()) return text;
+  }
+
+  return '';
+}
+
+
+async function callDeepSeek({ ownerName, message, history, world, assets }) {
+  if (!DEEPSEEK_API_KEY) {
+    throw Object.assign(
+      new Error('DEEPSEEK_API_KEY tapilmadi.'),
+      { status: 401 }
+    );
+  }
+
+  const actionMode = isActionMessage(message);
+  const system = buildSystemPrompt({
+    provider: 'deepseek',
+    ownerName,
+    world: actionMode ? compactWorld(world) : null,
+    assets: actionMode ? compactAssets(assets) : [],
+    actionMode,
+  });
+
+  const messages = [
+    { role: 'system', content: system },
+    ...history.slice(-MAX_HISTORY),
+    { role: 'user', content: clampText(message) },
+  ];
+
+  const body = {
+    model: DEEPSEEK_MODEL,
+    messages,
+    stream: false,
+    max_tokens: actionMode ? 5000 : 700,
+  };
+
+  const thinking = DEEPSEEK_THINKING.toLowerCase();
+  if (thinking === 'enabled') {
+    body.thinking = { type: 'enabled' };
+    body.reasoning_effort = DEEPSEEK_REASONING_EFFORT;
+  } else {
+    body.thinking = { type: 'disabled' };
+  }
+
+  if (actionMode) {
+    body.response_format = { type: 'json_object' };
+  }
+
+  const data = await fetchJson(
+    'https://api.deepseek.com/chat/completions',
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + DEEPSEEK_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    },
+    'DeepSeek'
+  );
+
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new Error('DeepSeek boş cavab qaytardı.');
+  }
+
+  return normalizeModelOutput(content);
+}
+
 async function callGPT({ ownerName, message, history, world, assets }) {
   if (!KIE_GPT_API_KEY) throw new Error('KIE_API_KEY / OPENAI_API_KEY tapilmadi.');
 
@@ -1041,19 +1129,15 @@ async function callGPT({ ownerName, message, history, world, assets }) {
     'KIE GPT-5.6 Sol'
   );
 
-  let content = typeof data?.output_text === 'string' ? data.output_text : '';
+  const content = extractKieText(data);
 
-  if (!content && Array.isArray(data?.output)) {
-    for (const item of data.output) {
-      if (item?.type !== 'message' || !Array.isArray(item.content)) continue;
-      content += item.content
-        .map(part => part?.type === 'output_text' ? safeString(part.text) : '')
-        .filter(Boolean)
-        .join('');
-    }
+  if (!content.trim()) {
+    const payload = parseKieResponsePayload(data);
+    const status = payload?.status ? ' status=' + payload.status : '';
+    const event = payload?.type ? ' type=' + payload.type : '';
+    console.error('[KIE EMPTY RESPONSE]', JSON.stringify(payload).slice(0, 4000));
+    throw new Error('KIE GPT-5.6 Sol cavabı oxunmadı.' + status + event);
   }
-
-  if (!content.trim()) throw new Error('KIE GPT-5.6 Sol boş cavab qaytardı.');
   return normalizeModelOutput(content);
 }
 async function callGemini({ ownerName, message, history, world, assets }) {
@@ -1195,7 +1279,7 @@ async function processAI(provider, body) {
 
   const world = safeBody.world || safeBody.worldSnapshot || null;
   const assets = safeBody.assets || safeBody.availableAssets || [];
-  const call = provider === 'gemini' ? callGemini : provider === 'grok' ? callGrok : callGPT;
+  const call = provider === 'gemini' ? callGemini : provider === 'grok' ? callGrok : provider === 'deepseek' ? callDeepSeek : callGPT;
 
   pushHistory(brain, 'user', message);
 
@@ -1231,20 +1315,26 @@ async function processAI(provider, body) {
       ? 'Gemini hazırda cavab verə bilmədi.'
       : provider === 'grok'
         ? 'Grok cavab verə bilmədi.'
-        : 'GPT hazırda cavab verə bilmədi.';
+        : provider === 'deepseek'
+          ? 'DeepSeek hazırda cavab verə bilmədi.'
+          : 'GPT hazırda cavab verə bilmədi.';
 
     if (status === 429) {
       reply = provider === 'gemini'
         ? 'Gemini sorğu limitinə çatdı. Bir az sonra yenidən yoxla.'
         : provider === 'grok'
           ? 'Grok sorğu limitinə çatdı. Bir az sonra yenidən yoxla.'
-          : 'GPT sorğu limitinə çatdı. Bir az sonra yenidən yoxla.';
+          : provider === 'deepseek'
+            ? 'DeepSeek sorğu limitinə çatdı. Bir az sonra yenidən yoxla.'
+            : 'GPT sorğu limitinə çatdı. Bir az sonra yenidən yoxla.';
     } else if (status === 401 || status === 403) {
       reply = provider === 'gemini'
         ? 'Gemini API açarı qəbul edilmədi.'
         : provider === 'grok'
           ? 'ZenMux API açarı qəbul edilmədi.'
-          : 'OpenAI API açarı qəbul edilmədi.';
+          : provider === 'deepseek'
+            ? 'DeepSeek API açarı qəbul edilmədi.'
+            : 'OpenAI API açarı qəbul edilmədi.';
     } else if (status === 400) {
       reply = 'AI sorğusunun formatında problem var.';
     }
@@ -1472,6 +1562,33 @@ async function generateStudioSource({ provider, prompt, ownerUserId, targetServi
       .replace(/^```(?:lua|luau)?\s*/i, '')
       .replace(/\s*```$/i, '')
       .trim();
+  }
+
+
+  if (provider === 'deepseek' && DEEPSEEK_API_KEY) {
+    const data = await fetchJson(
+      'https://api.deepseek.com/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + DEEPSEEK_API_KEY,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: DEEPSEEK_MODEL,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: prompt },
+          ],
+          stream: false,
+          thinking: { type: 'disabled' },
+          max_tokens: 5000,
+        }),
+      },
+      'DeepSeek Studio'
+    );
+    const raw = data?.choices?.[0]?.message?.content || '';
+    return String(raw).replace(/^```(?:lua|luau)?\s*/i, '').replace(/\s*```$/i, '').trim();
   }
 
   if (provider === 'gemini' && GEMINI_API_KEY) {
@@ -1727,12 +1844,14 @@ const server = http.createServer(async (req, res) => {
         gpt: KIE_GPT_MODEL,
         gemini: GEMINI_MODEL,
         grok: ZENMUX_GROK_MODEL,
+        deep: DEEPSEEK_MODEL,
       },
       keys: {
         kie: Boolean(KIE_GPT_API_KEY),
         openaiLegacy: Boolean(OPENAI_API_KEY),
         gemini: Boolean(GEMINI_API_KEY),
         grok: Boolean(ZENMUX_API_KEY),
+        deepseek: Boolean(DEEPSEEK_API_KEY),
         robloxToolbox: Boolean(ROBLOX_TOOLBOX_API_KEY),
       },
       brains: brains.size,
@@ -1831,14 +1950,16 @@ const server = http.createServer(async (req, res) => {
     provider = 'grok';
   } else if (url.pathname === '/gpt') {
     provider = 'gpt';
+  } else if (url.pathname === '/deepseek') {
+    provider = 'deepseek';
   } else {
     provider = normalizeProvider(body?.provider);
   }
 
-  if (url.pathname !== '/gpt' && url.pathname !== '/gemini' && url.pathname !== '/grok') {
+  if (url.pathname !== '/gpt' && url.pathname !== '/gemini' && url.pathname !== '/grok' && url.pathname !== '/deepseek') {
     sendJson(res, 404, {
       ok: false,
-      error: 'Endpoint tapılmadı. /gpt, /gemini və ya /grok istifadə edin.',
+      error: 'Endpoint tapılmadı. /gpt, /gemini, /grok və ya /deepseek istifadə edin.',
     });
     return;
   }
@@ -1872,12 +1993,15 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(' GPT endpoint:    http://127.0.0.1:' + PORT + '/gpt');
   console.log(' Gemini endpoint: http://127.0.0.1:' + PORT + '/gemini');
   console.log(' Grok endpoint:   http://127.0.0.1:' + PORT + '/grok');
+  console.log(' DeepSeek endpoint: http://127.0.0.1:' + PORT + '/deepseek');
   console.log(' GPT KIE model:     ' + KIE_GPT_MODEL);
   console.log(' Gemini model:    ' + GEMINI_MODEL);
   console.log(' Grok model:      ' + ZENMUX_GROK_MODEL);
+  console.log(' DeepSeek model:  ' + DEEPSEEK_MODEL);
   console.log(' KIE GPT key:       ' + (KIE_GPT_API_KEY ? 'OK' : 'YOOX'));
   console.log(' Gemini key:      ' + (GEMINI_API_KEY ? 'OK' : 'YOOX'));
   console.log(' ZenMux Grok key: ' + (ZENMUX_API_KEY ? 'OK' : 'YOOX'));
+  console.log(' DeepSeek key:    ' + (DEEPSEEK_API_KEY ? 'OK' : 'YOOX'));
   console.log('==============================================');
 });
 
